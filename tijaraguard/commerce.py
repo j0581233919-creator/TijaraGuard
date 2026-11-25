@@ -1,14 +1,23 @@
-"""Gate 2 — CatalogCopilot commercial verification & Arabic dialect adapter."""
+"""Gate 2 — CatalogCopilot commercial verification, Arabic dialect & grounded AI drafting adapter."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import re
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .deps import load_dependencies
-from .models import CommercialEvaluation, MalformedInputError, RedactedEnvelope, canonical_json
+from .models import (
+    CommercialEvaluation,
+    MalformedInputError,
+    PrivacyViolationError,
+    RedactedEnvelope,
+    canonical_json,
+)
 from .privacy import PrivacyGate, strip_redaction_markers
+from .providers.base import AIRequest, ProviderExecutionError, TaskComplexity
+from .providers.router import ModelRouter
 
 _DEPS = load_dependencies()
 _cc = _DEPS.catalog_copilot
@@ -25,6 +34,92 @@ LeadInquiry = _cc.LeadInquiry
 VerificationReport = _cc.VerificationReport
 VerificationStatus = _cc.VerificationStatus
 parse_dialectal_inquiry = _cc.parse_dialectal_inquiry
+
+
+def build_grounded_ai_callable(
+    ai_router: ModelRouter,
+    privacy_gate: Optional[PrivacyGate] = None,
+    *,
+    task_complexity: TaskComplexity = TaskComplexity.STANDARD,
+    fallback_to_template: bool = True,
+    on_metadata: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Callable[[str, Dict[str, Any]], str]:
+    """Builds a CatalogCopilot custom_llm_callable backed by ModelRouter.
+
+    AI output is ALWAYS a draft and never an authoritative source of commercial facts;
+    CatalogCopilot's deterministic verifier validates every claim afterward.
+    """
+
+    def _call(base_draft: str, context: Dict[str, Any]) -> str:
+        lang = str(context.get("preferred_language") or "ar")
+        inquiry_text = str(context.get("inquiry_text") or "")
+        item_dict = dict(context.get("item") or {})
+        customer_name = str(context.get("customer_name") or "Customer")
+
+        if privacy_gate is not None:
+            for field_name, val in (("inquiry_text", inquiry_text), ("customer_name", customer_name)):
+                leaked = privacy_gate.verify_text_clean(val)
+                if leaked:
+                    raise PrivacyViolationError(
+                        f"Blocked outbound AI prompt with residual PII in {field_name}: {leaked}"
+                    )
+
+        system_prompt = (
+            "You are TijaraGuard, a polite commercial customer-support assistant. "
+            "Respond strictly in the customer's language ("
+            + ("Arabic (MSA/clear polite tone)" if lang == "ar" else "English")
+            + "). You MUST ONLY state prices, currency, stock availability, discounts, and offer "
+            "details that appear verbatim in the provided JSON catalog item. NEVER invent discounts, "
+            "warranties, free shipping, or lower prices. NEVER include personal identifiers."
+        )
+        user_prompt = (
+            f"Customer Handle: {customer_name}\n"
+            f"Redacted Customer Inquiry: {inquiry_text}\n"
+            f"Verified Catalog Fact Sheet (JSON): {json.dumps(item_dict, ensure_ascii=False)}\n"
+            f"Grounded Reference Template:\n{base_draft}\n\n"
+            "Write a concise, helpful response strictly adhering to the Verified Catalog Fact Sheet."
+        )
+
+        req = AIRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            task_complexity=task_complexity,
+            temperature=0.2,
+            max_tokens=450,
+            metadata={"sku": item_dict.get("sku"), "language": lang},
+        )
+        try:
+            resp = ai_router.generate(req)
+            if on_metadata is not None:
+                on_metadata(
+                    {
+                        "ai_provider": resp.provider,
+                        "ai_model": resp.model,
+                        "usage": resp.usage.to_dict(),
+                        "latency_ms": round(resp.latency_ms, 2),
+                        "fallback_events": list(resp.fallback_events),
+                        "finish_reason": resp.finish_reason,
+                        "mode": "ai_generated",
+                    }
+                )
+            return resp.content
+        except ProviderExecutionError as exc:
+            if not fallback_to_template:
+                raise
+            if on_metadata is not None:
+                on_metadata(
+                    {
+                        "ai_provider": "deterministic_template_fallback",
+                        "ai_model": "catalog_copilot_template",
+                        "mode": "template_fallback",
+                        "fallback_from": exc.provider,
+                        "error_code": exc.code.value,
+                        "error_message": str(exc),
+                    }
+                )
+            return base_draft
+
+    return _call
 
 
 class CommercialGate:
@@ -70,6 +165,9 @@ class CommercialGate:
         envelope: RedactedEnvelope,
         *,
         custom_llm_callable: Optional[Callable[[str, Dict[str, Any]], str]] = None,
+        ai_router: Optional[ModelRouter] = None,
+        task_complexity: TaskComplexity = TaskComplexity.STANDARD,
+        fallback_to_template_on_ai_error: bool = True,
     ) -> CommercialEvaluation:
         """Matches redacted inquiry to catalog and verifies the generated/LLM draft."""
         cleaned_query = strip_redaction_markers(envelope.redacted_text)
@@ -93,7 +191,6 @@ class CommercialGate:
             if fuzzy_res.has_match and not fuzzy_res.is_ambiguous and fuzzy_res.resolved_item:
                 resolved_sku = fuzzy_res.resolved_item.sku
             elif not fuzzy_res.is_ambiguous:
-                # If extra PII-bearing clauses diluted full-message score, check individual clauses.
                 clauses = [c.strip() for c in re.split(r"[؟?!.\n]+", cleaned_query) if c.strip()]
                 clause_matches: Dict[str, Any] = {}
                 for clause in clauses:
@@ -112,7 +209,6 @@ class CommercialGate:
                     resolved_sku = only_res.resolved_item.sku
                     resolution_notes = only_res.resolution_notes
 
-        # Use channel='chat' + opaque contact_ref so LeadInquiry never needs raw phone/email.
         lead = LeadInquiry(
             lead_id=envelope.message_id,
             customer_name=envelope.customer_handle,
@@ -125,13 +221,39 @@ class CommercialGate:
             requested_sku=resolved_sku,
         )
 
+        ai_meta_box: Dict[str, Any] = {}
+        active_llm_callable = custom_llm_callable
+        if active_llm_callable is None and ai_router is not None:
+            active_llm_callable = build_grounded_ai_callable(
+                ai_router,
+                self.privacy_gate,
+                task_complexity=task_complexity,
+                fallback_to_template=fallback_to_template_on_ai_error,
+                on_metadata=lambda m: ai_meta_box.update(m),
+            )
+
+        # Note: CatalogCopilot's DraftGenerator swallows exceptions from custom_llm_callable;
+        # when fallback_to_template_on_ai_error is False we want explicit ProviderExecutionError propagation.
+        captured_fatal_error: list[BaseException] = []
+
+        def _guarded_callable(base_body: str, ctx: Dict[str, Any]) -> str:
+            assert active_llm_callable is not None
+            try:
+                return active_llm_callable(base_body, ctx)
+            except (ProviderExecutionError, PrivacyViolationError) as exc:
+                if not fallback_to_template_on_ai_error or isinstance(exc, PrivacyViolationError):
+                    captured_fatal_error.append(exc)
+                raise
+
+        callable_for_generator = _guarded_callable if active_llm_callable is not None else None
         draft: DraftMessage = self.generator.generate_draft(
             lead=lead,
             catalog=self.catalog,
-            custom_llm_callable=custom_llm_callable,
+            custom_llm_callable=callable_for_generator,
         )
+        if captured_fatal_error:
+            raise captured_fatal_error[0]
 
-        # Reuse DraftGenerator's deterministic verification report without redundant re-run.
         report: VerificationReport = draft.verification_report
         report_dict = report.to_dict()
         status = report.status.value
@@ -139,7 +261,6 @@ class CommercialGate:
         final_subject = draft.subject
         final_body = draft.body
 
-        # Defense-in-depth: ensure simulated LLM never persists raw PII into body, subject, or report.
         if self.privacy_gate is not None:
             leaked_in_body = self.privacy_gate.verify_text_clean(final_body)
             leaked_in_subject = self.privacy_gate.verify_text_clean(final_subject)
@@ -158,8 +279,6 @@ class CommercialGate:
                 report_dict["reasons"] = list(reasons)
 
         checks = list(report_dict["checks"])
-
-        # Preserve explicit inquiry/resolution metadata cleanly.
         fuzzy_note = draft.fuzzy_match_notes or resolution_notes
         detected_dialect = (
             draft.detected_dialect
@@ -168,6 +287,15 @@ class CommercialGate:
         intents = draft.query_intents or (
             [i.value for i in dialect_analysis.intents] if dialect_analysis else []
         )
+
+        ai_provider = ai_meta_box.get("ai_provider")
+        ai_model = ai_meta_box.get("ai_model")
+        if ai_provider is None and custom_llm_callable is not None:
+            ai_provider = "custom_callable"
+            ai_model = "custom"
+        elif ai_provider is None:
+            ai_provider = "deterministic_template"
+            ai_model = "catalog_copilot_template"
 
         return CommercialEvaluation(
             draft_id=draft.draft_id,
@@ -183,6 +311,9 @@ class CommercialGate:
             query_intents=intents,
             fuzzy_match_notes=fuzzy_note,
             verification_report_dict=report_dict,
+            ai_provider=ai_provider,
+            ai_model=ai_model,
+            ai_metadata=ai_meta_box,
         )
 
     def verify_edited_body(

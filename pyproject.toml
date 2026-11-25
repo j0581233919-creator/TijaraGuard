@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tijaraguard"
-version = "0.1.0"
-description = "TijaraGuard isolated integration MVP combining BayanGate privacy redaction, CatalogCopilot commercial claim verification, SQLite single-use human approval, and MessageShield durable loopback delivery."
+version = "0.2.0b1"
+description = "TijaraGuard commercial customer-support and sales-assistance platform combining BayanGate privacy redaction, multi-provider AI drafting, CatalogCopilot deterministic claim verification, SQLite single-use human approval, official messaging channels, and MessageShield durable delivery."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
@@ -16,3 +16,14 @@ tijaraguard = "tijaraguard.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["tijaraguard*"]
+
+[tool.setuptools.package-data]
+tijaraguard = [
+    "web/*",
+    "_vendor/MANIFEST.json",
+    "_vendor/*/LICENSE",
+    "_vendor/*/THIRD_PARTY_NOTICES.md",
+    "_vendor/*/*.py",
+    "_vendor/*/*/*.py",
+    "_vendor/*/*/*/*.py",
+]

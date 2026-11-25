@@ -2,53 +2,41 @@
 
 ## 1. Prerequisites
 
-- Python `3.11` or newer (tested on Python `3.12.3` on Linux).
+- Python `3.11` or newer (verified on Python `3.12.3` on Linux).
 - Standard library + built-in SQLite only (`dependencies = []`, zero `pip` installs required).
-- Read-only local sibling checkouts expected next to this directory:
-  - `../bayan-gate/repo` (`BayanGate`)
-  - `../catalog-copilot/repo` (`CatalogCopilot`)
-  - `../message-shield/repo` (`MessageShield`)
+- Works standalone from a fresh checkout using MIT-attributed vendored snapshots under `tijaraguard/_vendor/` (verified via `MANIFEST.json` SHA-256 checksums), or automatically uses read-only sibling repositories / `TIJARAGUARD_*_PATH` overrides when present.
 
-If the sibling repositories live elsewhere, override their paths using environment variables:
+## 2. Clean-Room Installation
 
 ```bash
-export TIJARAGUARD_BAYAN_GATE_PATH="/path/to/bayan-gate/repo"
-export TIJARAGUARD_CATALOG_COPILOT_PATH="/path/to/catalog-copilot/repo"
-export TIJARAGUARD_MESSAGE_SHIELD_PATH="/path/to/message-shield/repo"
-```
+git clone https://github.com/j0581233919-creator/TijaraGuard.git
+cd TijaraGuard
 
-## 2. Running Without Modifying Dependency Repositories
+# Optional editable or standard install into a virtualenv
+python3 -m venv .venv
+.venv/bin/python -B -m pip install --no-deps --no-build-isolation -e .
 
-Always invoke Python with `-B` and `PYTHONDONTWRITEBYTECODE=1` so Python does not write `__pycache__` directories into the read-only dependency repositories (TijaraGuard also sets `sys.dont_write_bytecode = True` on import as defense-in-depth).
-
-```bash
-cd "/media/islam/shared pop/GitHub/tijaraguard-prototype"
+# Verify dependencies & bundled manifest integrity
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard inspect-deps
 ```
 
-## 3. CLI Operations
+## 3. CLI Reference
 
-### Run the Complete Synthetic Demonstration
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard demo --state-dir .state/my-demo
-```
-
-This creates isolated SQLite databases in `.state/my-demo/` and outputs JSON summarizing:
-- Gate 1 PII redaction + Shadow Mode (`SIMULATED_NO_SEND`)
-- Gate 2 adversarial LLM hallucination blocking
-- Gate 3 post-approval payload tampering detection
-- Gate 4 lost-ACK (`drop_ack=True`) -> `UNKNOWN` -> read-only recovery (`DELIVERED`, 1 logical inbox row, 1 POST attempt)
-- Hash-chain audit verification and zero-PII leak counts
-
-### Verify an Existing Ledger Audit Chain
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard verify-audit .state/my-demo/ledger.sqlite3
-```
-
-## 4. Operator Security Notes
-
-- Keep `approval_secret` and `contact_hash_key` out of source control and supply >= 32 cryptographically random bytes at runtime.
-- Never place SQLite ledger/outbox state on world-writable shared filesystems in production; use a private POSIX directory (`0700`) and restricted file permissions (`0600`). Note that `fuseblk`/NTFS mounts ignore POSIX `chmod`.
-- Never manually clear `UNKNOWN_DELIVERY` records or invent new message IDs to force a retry; always reconcile via `recover_delivery()`.
+- `tijaraguard inspect-deps` — Inspect resolved dependencies (`sibling_repo` / `vendored`) and manifest checksums.
+- `tijaraguard demo [--state-dir DIR]` — Run the 4-gate synthetic Arabic business demonstration.
+- `tijaraguard verify-audit LEDGER_DB` — Verify triggers, sequence continuity, and SHA-256 hash chain read-only.
+- `tijaraguard check-config` — Validate catalog, secret lengths, SSRF rules, providers, and channels.
+- `tijaraguard serve [--host HOST] [--port PORT]` — Start REST API, webhooks, and operator web console (`/`).
+- `tijaraguard catalog-search QUERY [--lang ar|en]` — Fuzzy catalog SKU resolution.
+- `tijaraguard ingest --message-id ... --text ...` — Run Gate 1 -> Gate 2 -> Gate 3 on an inquiry.
+- `tijaraguard drafts [--state STATE]` — List drafts from the ledger.
+- `tijaraguard approve DRAFT_ID --reviewer ID --payload-sha256 HEX` — Issue single-use approval lease.
+- `tijaraguard edit DRAFT_ID --actor ID --body TEXT` — Edit and re-verify draft (revokes old lease).
+- `tijaraguard reject DRAFT_ID --reviewer ID --reason TEXT` — Reject draft.
+- `tijaraguard escalate DRAFT_ID --actor ID --reason TEXT` — Escalate draft to human operator.
+- `tijaraguard dispatch DRAFT_ID [--target TARGET]` — Consume active approval lease and dispatch.
+- `tijaraguard recover DRAFT_ID` — Reconcile `UNKNOWN_DELIVERY` / `DISPATCHING` without replaying POST.
+- `tijaraguard providers-health` — Check connectivity/auth on configured AI providers.
+- `tijaraguard backup DEST_PATH` — Create a verified SQLite hot backup.
+- `tijaraguard restore BACKUP_FILE TARGET_DB` — Verify backup audit chain and restore atomically.
+- `tijaraguard purge-retention` — Apply data retention purge to expired terminal drafts and replay keys.

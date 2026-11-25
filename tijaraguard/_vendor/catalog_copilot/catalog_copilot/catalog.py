@@ -1,0 +1,271 @@
+"""Catalog loader, validator, and indexed search engine for CatalogCopilot."""
+
+from __future__ import annotations
+import csv
+import json
+import math
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Union
+from .models import CatalogItem
+from .fuzzy import FuzzyCatalogMatcher, FuzzyCandidate, ResolutionResult
+
+# Arabic character normalization mapping
+_ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_TASHKEEL_REGEX = re.compile(r"[\u0617-\u061A\u064B-\u0652]")
+
+
+def normalize_arabic_text(text: str) -> str:
+    """Normalizes Arabic text for robust search token matching and indexing."""
+    if not text:
+        return ""
+    # Strip tashkeel
+    t = _TASHKEEL_REGEX.sub("", text)
+    # Translate Arabic-Indic numerals
+    t = t.translate(_ARABIC_INDIC_DIGITS)
+    # Normalize Alef forms
+    t = re.sub(r"[إأآا]", "ا", t)
+    # Normalize Teh Marbuta and Heh
+    t = re.sub(r"ة", "ه", t)
+    # Normalize Alef Maksura and Yeh
+    t = re.sub(r"ى", "ي", t)
+    return t.strip().lower()
+
+
+class Catalog:
+    """In-memory indexed catalog providing fast lookup and grounded search."""
+
+    def __init__(self, items: Optional[List[CatalogItem]] = None):
+        self._items_by_sku: Dict[str, CatalogItem] = {}
+        if items:
+            for item in items:
+                self.add_item(item)
+
+    def add_item(self, item: CatalogItem) -> None:
+        sku = item.sku.strip().upper()
+        if sku in self._items_by_sku:
+            raise ValueError(f"Duplicate SKU '{sku}' detected in catalog. Each SKU must be unique.")
+        self._items_by_sku[sku] = item
+
+    def get_item(self, sku: str) -> Optional[CatalogItem]:
+        """Lookup item strictly by SKU."""
+        if not sku:
+            return None
+        return self._items_by_sku.get(str(sku).strip().upper())
+
+    def list_items(self) -> List[CatalogItem]:
+        """Returns all catalog items."""
+        return list(self._items_by_sku.values())
+
+    def search(self, query: str, lang: str = "ar", limit: int = 5) -> List[CatalogItem]:
+        """Fuzzy/token search against title and category in Arabic or English."""
+        if not query:
+            return []
+        q_norm = normalize_arabic_text(query) if lang == "ar" else query.strip().lower()
+        q_tokens = [t for t in re.split(r"\s+", q_norm) if t]
+        if not q_tokens:
+            return []
+
+        scored_items: List[tuple[int, CatalogItem]] = []
+        for item in self._items_by_sku.values():
+            if lang == "ar":
+                target = normalize_arabic_text(f"{item.title_ar} {item.category} {item.offer_description_ar or ''}")
+            else:
+                target = f"{item.title_en} {item.category} {item.offer_description_en or ''}".lower()
+
+            matches = sum(1 for token in q_tokens if token in target)
+            if matches > 0:
+                scored_items.append((matches, item))
+
+        scored_items.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored_items[:limit]]
+
+    def fuzzy_search(self, query: str, lang: str = "ar", limit: int = 5) -> List[FuzzyCandidate]:
+        """Performs fuzzy matching across catalog items, returning ranked scored candidates."""
+        matcher = FuzzyCatalogMatcher()
+        candidates: List[FuzzyCandidate] = []
+        for item in self._items_by_sku.values():
+            cand = matcher.score_item_against_query(item, query, lang=lang)
+            if cand.score > 0.30:
+                candidates.append(cand)
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates[:limit]
+
+    def resolve_item_fuzzy(
+        self,
+        query: str,
+        lang: str = "ar",
+        min_confidence: float = 0.72,
+        min_margin: float = 0.12,
+    ) -> ResolutionResult:
+        """Resolves query against catalog items with deterministic fail-closed ambiguity checks."""
+        matcher = FuzzyCatalogMatcher(min_confidence=min_confidence, min_margin=min_margin)
+        return matcher.resolve(list(self._items_by_sku.values()), query, lang=lang)
+
+    @property
+    def total_count(self) -> int:
+        return len(self._items_by_sku)
+
+    @property
+    def active_count(self) -> int:
+        return sum(1 for item in self._items_by_sku.values() if item.is_active)
+
+    @property
+    def in_stock_count(self) -> int:
+        return sum(1 for item in self._items_by_sku.values() if item.in_stock)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "total_items": self.total_count,
+            "active_items": self.active_count,
+            "in_stock_items": self.in_stock_count,
+            "out_of_stock_items": self.total_count - self.in_stock_count,
+        }
+
+
+class CatalogLoader:
+    """Validates and loads catalogs from CSV, JSON, or Python data structures."""
+
+    @staticmethod
+    def _validate_raw_record(row: Dict[str, Any], index: int) -> CatalogItem:
+        sku = str(row.get("sku") or "").strip().upper()
+        if not sku:
+            raise ValueError(f"Record at index {index} is missing required 'sku' field.")
+
+        title_en = str(row.get("title_en") or "").strip()
+        title_ar = str(row.get("title_ar") or "").strip()
+        if not title_en or not title_ar:
+            raise ValueError(f"SKU '{sku}' is missing bilingual titles (title_en or title_ar).")
+
+        price_raw = row.get("price")
+        if price_raw is None or str(price_raw).strip() == "":
+            raise ValueError(f"Record at index {index} is missing required 'price' field.")
+
+        try:
+            price_val = str(price_raw).translate(_ARABIC_INDIC_DIGITS)
+            price = float(price_val)
+        except (ValueError, TypeError):
+            raise ValueError(f"SKU '{sku}' has invalid non-numeric price: {price_raw}")
+
+        if math.isnan(price) or math.isinf(price) or price < 0:
+            raise ValueError(f"SKU '{sku}' has invalid non-finite or negative price: {price}. Price must be >= 0.")
+
+        currency = str(row.get("currency") or "SAR").strip().upper()
+
+        stock_raw = row.get("stock_quantity")
+        if stock_raw is None or str(stock_raw).strip() == "":
+            stock = 0
+        else:
+            try:
+                stock_val = str(stock_raw).translate(_ARABIC_INDIC_DIGITS)
+                stock = int(stock_val)
+            except (ValueError, TypeError):
+                raise ValueError(f"SKU '{sku}' has invalid stock quantity: {stock_raw}")
+
+        if stock < 0:
+            raise ValueError(f"SKU '{sku}' has negative stock: {stock}. Stock must be >= 0.")
+
+        # Active flag
+        is_active_raw = row.get("is_active", True)
+        if isinstance(is_active_raw, str):
+            is_active = is_active_raw.strip().lower() in ("true", "1", "yes", "t")
+        else:
+            is_active = bool(is_active_raw)
+
+        # Discount percent
+        discount_percent = 0.0
+        if row.get("discount_percent") not in (None, ""):
+            try:
+                discount_percent = float(str(row["discount_percent"]).translate(_ARABIC_INDIC_DIGITS))
+            except ValueError:
+                raise ValueError(f"SKU '{sku}' has invalid discount percent: {row.get('discount_percent')}")
+            if math.isnan(discount_percent) or math.isinf(discount_percent) or not (0.0 <= discount_percent <= 100.0):
+                raise ValueError(f"SKU '{sku}' discount percent {discount_percent} out of range [0, 100].")
+
+        # Discount price
+        discount_price = None
+        if row.get("discount_price") not in (None, ""):
+            try:
+                discount_price = float(str(row["discount_price"]).translate(_ARABIC_INDIC_DIGITS))
+            except ValueError:
+                raise ValueError(f"SKU '{sku}' has invalid discount price: {row.get('discount_price')}")
+            if math.isnan(discount_price) or math.isinf(discount_price) or discount_price < 0 or discount_price > price:
+                raise ValueError(f"SKU '{sku}' discount price {discount_price} must be between 0 and standard price {price}.")
+
+        # Exact currency-appropriate mathematical consistency check
+        if discount_percent > 0 and discount_price is not None:
+            expected_price = round(price * (1.0 - (discount_percent / 100.0)), 2)
+            if abs(discount_price - expected_price) > 0.01:
+                raise ValueError(
+                    f"SKU '{sku}' has contradictory discount_price ({discount_price}) and discount_percent ({discount_percent}%). "
+                    f"Exact expected discount price is {expected_price}."
+                )
+        elif discount_percent == 0.0 and discount_price is not None:
+            if abs(discount_price - price) > 0.01:
+                raise ValueError(
+                    f"SKU '{sku}' specifies discount_price {discount_price} but discount_percent is 0%. Prices must match."
+                )
+
+        offer_valid_from = str(row.get("offer_valid_from") or "").strip() or None
+        offer_valid_until = str(row.get("offer_valid_until") or "").strip() or None
+
+        return CatalogItem(
+            sku=sku,
+            title_en=title_en,
+            title_ar=title_ar,
+            price=price,
+            currency=currency,
+            stock_quantity=stock,
+            is_active=is_active,
+            discount_percent=discount_percent,
+            discount_price=discount_price,
+            offer_description_en=str(row.get("offer_description_en") or "").strip() or None,
+            offer_description_ar=str(row.get("offer_description_ar") or "").strip() or None,
+            offer_valid_from=offer_valid_from,
+            offer_valid_until=offer_valid_until,
+            category=str(row.get("category") or "").strip(),
+        )
+
+    @classmethod
+    def load_from_dict_list(cls, records: List[Dict[str, Any]]) -> Catalog:
+        catalog = Catalog()
+        for idx, row in enumerate(records):
+            item = cls._validate_raw_record(row, idx)
+            catalog.add_item(item)
+        return catalog
+
+    @classmethod
+    def load_csv(cls, filepath: Union[str, Path]) -> Catalog:
+        path = Path(filepath)
+        if not path.is_file():
+            raise FileNotFoundError(f"Catalog CSV file not found at: {path}")
+
+        records = []
+        with open(path, mode="r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            required_headers = {"sku", "title_en", "title_ar", "price"}
+            if not reader.fieldnames or not required_headers.issubset(set(reader.fieldnames)):
+                missing = required_headers - set(reader.fieldnames or [])
+                raise ValueError(f"Catalog CSV is missing required headers: {missing}")
+
+            for row in reader:
+                records.append(row)
+        return cls.load_from_dict_list(records)
+
+    @classmethod
+    def load_json(cls, filepath: Union[str, Path]) -> Catalog:
+        path = Path(filepath)
+        if not path.is_file():
+            raise FileNotFoundError(f"Catalog JSON file not found at: {path}")
+
+        with open(path, mode="r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict) and "items" in data:
+            records = data["items"]
+        elif isinstance(data, list):
+            records = data
+        else:
+            raise ValueError(f"Invalid JSON catalog format. Expected a list of items or an object with an 'items' key.")
+
+        return cls.load_from_dict_list(records)

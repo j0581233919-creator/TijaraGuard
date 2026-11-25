@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from .deps import load_dependencies
 from .models import DeliveryError, MalformedInputError, validate_safe_id
+from .security import SSRFError, harden_state_permissions, validate_outbound_url
 
 _DEPS = load_dependencies()
 _ms = _DEPS.message_shield
@@ -34,7 +35,7 @@ from message_shield.transport import delivery_key as ms_delivery_key  # type: ig
 
 
 def validate_loopback_endpoint(url: str) -> str:
-    """Validates endpoint through MessageShield rules and restricts MVP to literal loopback."""
+    """Validates endpoint through MessageShield rules and restricts default mode to literal loopback."""
     try:
         normalized = ms_endpoint(url)
     except ValueError as exc:
@@ -42,7 +43,7 @@ def validate_loopback_endpoint(url: str) -> str:
     parsed = urlsplit(normalized)
     if parsed.hostname not in ("127.0.0.1", "::1"):
         raise DeliveryError(
-            "TijaraGuard MVP restricts Gate 4 delivery to literal loopback endpoints (127.0.0.1 or ::1)."
+            "TijaraGuard loopback mode restricts Gate 4 delivery to literal loopback endpoints (127.0.0.1 or ::1)."
         )
     return normalized
 
@@ -83,21 +84,42 @@ class MessageShieldDeliveryAdapter:
         tenant: str = "tijaraguard",
         source: str = "approved_draft",
         timeout: float = 2.0,
+        allow_remote_https: bool = False,
+        allow_loopback_http: bool = False,
+        transport: Optional[Any] = None,
     ) -> None:
         self.outbox_db_path = Path(outbox_db_path).resolve()
         self.outbox_db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.endpoint_url = validate_loopback_endpoint(endpoint_url)
+        harden_state_permissions(self.outbox_db_path.parent, is_dir=True)
+
+        if allow_remote_https:
+            try:
+                checked = validate_outbound_url(
+                    endpoint_url,
+                    allow_loopback=allow_loopback_http,
+                    allow_http_loopback=allow_loopback_http,
+                )
+                self.endpoint_url = ms_endpoint(checked)
+            except (SSRFError, ValueError) as exc:
+                raise DeliveryError(f"Invalid delivery endpoint: {exc}") from exc
+        else:
+            self.endpoint_url = validate_loopback_endpoint(endpoint_url)
+
         ms_identifier(tenant)
         ms_identifier(source)
         self.tenant = tenant
         self.source = source
         self.timeout = float(timeout)
+        self._custom_transport = transport
         self.shield = Shield(
             self.outbox_db_path,
             self.endpoint_url,
             create=not self.outbox_db_path.exists(),
             timeout=self.timeout,
         )
+        if transport is not None:
+            self.shield.transport = transport
+        harden_state_permissions(self.outbox_db_path, is_dir=False)
 
     def admit_and_send(
         self,
@@ -107,6 +129,7 @@ class MessageShieldDeliveryAdapter:
         ttl_seconds: int = 3600,
         max_attempts: int = 3,
         backoff_seconds: float = 0.05,
+        transport: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Admits an approved payload to MessageShield and executes one send attempt."""
         if not isinstance(text, str) or not text.strip():
@@ -126,29 +149,40 @@ class MessageShieldDeliveryAdapter:
             "max_attempts": max_attempts,
             "backoff_seconds": backoff_seconds,
         }
+        active_transport = transport if transport is not None else self._custom_transport
         try:
             self.shield.admit(tenant, request)
-            return self.shield.send(tenant, source, msg_id)
+            return self.shield.send(tenant, source, msg_id, transport=active_transport)
         except (ValueError, MessageShieldConflict) as exc:
             raise DeliveryError(f"MessageShield rejected delivery admission/send: {exc}") from exc
 
-    def recover(self, draft_id: str) -> Dict[str, Any]:
-        """Performs read-only GET receipt reconciliation without replaying POST."""
+    def recover(self, draft_id: str, *, transport: Optional[Any] = None) -> Dict[str, Any]:
+        """Performs read-only receipt reconciliation without replaying POST."""
         tenant, source, msg_id = build_shield_identity(
             draft_id, tenant=self.tenant, source=self.source
         )
+        active_transport = transport if transport is not None else self._custom_transport
         try:
-            return self.shield.recover(tenant, source, msg_id)
+            return self.shield.recover(tenant, source, msg_id, transport=active_transport)
         except (ValueError, MessageShieldMissing, MessageShieldConflict) as exc:
             raise DeliveryError(f"MessageShield recovery failed: {exc}") from exc
 
-    def drain(self, draft_id: str) -> Dict[str, Any]:
+    def drain(self, draft_id: str, *, transport: Optional[Any] = None) -> Dict[str, Any]:
         """Executes bounded MessageShield pre-request connection retries."""
         tenant, source, msg_id = build_shield_identity(
             draft_id, tenant=self.tenant, source=self.source
         )
+        active_transport = transport if transport is not None else self._custom_transport
         try:
-            return self.shield.drain(tenant, source, msg_id)
+            message = self.shield.get(tenant, source, msg_id)
+            for _ in range(3):
+                if message["state"] != "PENDING":
+                    break
+                wait = max(0.0, float(message["next_at"]) - time.time())
+                if wait > 0:
+                    time.sleep(wait)
+                message = self.shield.send(tenant, source, msg_id, transport=active_transport)
+            return message
         except (ValueError, MessageShieldMissing, MessageShieldConflict) as exc:
             raise DeliveryError(f"MessageShield drain failed: {exc}") from exc
 
@@ -278,7 +312,6 @@ class LocalLoopbackReceiver:
                 self.connection.settimeout(3.0)
 
             def log_message(self, format: str, *args: Any) -> None:
-                # Never write HTTP logs that might echo payload metadata.
                 return
 
             def _send_json(self, status_code: int, obj: Dict[str, Any]) -> None:

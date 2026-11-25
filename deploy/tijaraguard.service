@@ -1,0 +1,29 @@
+[Unit]
+Description=TijaraGuard Commercial Support & Verification Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tijaraguard
+Group=tijaraguard
+WorkingDirectory=/opt/tijaraguard
+EnvironmentFile=/etc/tijaraguard/tijaraguard.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -B -m tijaraguard serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Filesystem & Privilege Hardening
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tijaraguard
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

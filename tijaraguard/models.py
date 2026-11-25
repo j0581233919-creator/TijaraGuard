@@ -12,7 +12,9 @@ from typing import Any, Dict, List, Optional
 
 _SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
-_SUPPORTED_CHANNELS = frozenset({"whatsapp", "chat", "sms", "email", "phone"})
+_SUPPORTED_CHANNELS = frozenset(
+    {"whatsapp", "telegram", "chatwoot", "webhook", "chat", "sms", "email", "phone"}
+)
 _SUPPORTED_LANGS = frozenset({"ar", "en"})
 
 
@@ -52,11 +54,20 @@ class DeliveryError(TijaraGuardError):
     """Raised on delivery configuration or gateway protocol failures."""
 
 
+class ProviderError(TijaraGuardError):
+    """Raised when an external or local AI provider fails or is misconfigured."""
+
+
+class ChannelError(TijaraGuardError):
+    """Raised when a messaging channel adapter fails validation or transport."""
+
+
 class ExecutionMode(str, Enum):
     """Controls outbound delivery behavior; defaults to Shadow Mode."""
 
     SHADOW = "SIMULATED_NO_SEND"
     LOOPBACK_LIVE = "LOOPBACK_LIVE"
+    LIVE = "LIVE"
 
 
 class DraftState(str, Enum):
@@ -67,6 +78,7 @@ class DraftState(str, Enum):
     PENDING_APPROVAL = "PENDING_APPROVAL"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    ESCALATED = "ESCALATED"
     SHADOW_RECORDED = "SHADOW_RECORDED"
     DISPATCHING = "DISPATCHING"
     UNKNOWN_DELIVERY = "UNKNOWN_DELIVERY"
@@ -142,10 +154,13 @@ class InboundMessage:
     preferred_language: str
     raw_text: str
     requested_sku: Optional[str] = None
+    tenant_id: str = "default"
+    channel_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         validate_safe_id(self.message_id, "message_id")
         validate_safe_id(self.conversation_id, "conversation_id")
+        validate_safe_id(self.tenant_id, "tenant_id")
         if not isinstance(self.customer_handle, str) or not self.customer_handle.strip():
             raise MalformedInputError("Field 'customer_handle' must be a non-empty string.")
         if not isinstance(self.raw_contact_target, str) or not self.raw_contact_target.strip():
@@ -186,6 +201,11 @@ class InboundMessage:
                 validate_safe_id(sku, "requested_sku")
             object.__setattr__(self, "requested_sku", sku or None)
 
+        if self.channel_metadata is None:
+            object.__setattr__(self, "channel_metadata", {})
+        elif not isinstance(self.channel_metadata, dict):
+            raise MalformedInputError("Field 'channel_metadata' must be a dictionary.")
+
 
 @dataclass(frozen=True)
 class RedactedEnvelope:
@@ -202,6 +222,8 @@ class RedactedEnvelope:
     redacted_text: str
     requested_sku: Optional[str]
     pii_summary: Dict[str, Any] = field(default_factory=dict)
+    tenant_id: str = "default"
+    channel_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -221,6 +243,9 @@ class CommercialEvaluation:
     query_intents: List[str]
     fuzzy_match_notes: Optional[str]
     verification_report_dict: Dict[str, Any]
+    ai_provider: Optional[str] = None
+    ai_model: Optional[str] = None
+    ai_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

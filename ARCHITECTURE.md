@@ -1,63 +1,39 @@
 # TijaraGuard Architecture & Threat Model
 
-## 1. System Architecture
+## 1. Layered Product Architecture
 
-TijaraGuard wraps three unmodified, read-only sibling repositories (`BayanGate`, `CatalogCopilot`, `MessageShield`) behind narrow Python adapters orchestrated by `TijaraGuardPipeline` ([tijaraguard/pipeline.py](tijaraguard/pipeline.py)):
+TijaraGuard separates domain safety gates, AI provider routing, official messaging adapters, SQLite persistence, and the operator interface into independent modules:
 
 ```mermaid
 flowchart TD
-    IN["InboundMessage (raw Arabic/English + PII)"] --> G1["Gate 1: PrivacyGate (BayanGate Adapter)"]
+    CH["Channels: WhatsApp / Telegram / Chatwoot / Webhook / API"] -->|"Signature + Replay + Rate Limit"| G1["Gate 1: PrivacyGate (BayanGate)"]
     G1 -->|"Redacts PII + HMAC contact_ref"| ENV["RedactedEnvelope (0 raw PII)"]
-    ENV --> G2["Gate 2: CommercialGate (CatalogCopilot Adapter)"]
-    G2 -->|"Dialect Parse + Fuzzy SKU + Claim Verifier + Privacy Re-check"| G3["Gate 3: ApprovalLedger (SQLite WAL)"]
-    G3 -->|"FAIL / missing consent"| BLK["VERIFIED_BLOCKED (Cannot Approve/Send)"]
+    ENV --> ROUTE["EphemeralRouteStore (routes.sqlite3)"]
+    ENV --> G2["Gate 2: CommercialGate (CatalogCopilot) + ModelRouter"]
+    AI["Cloud/Local AI Providers: OpenAI-compat / Anthropic / Gemini / Ollama"] <-->|"Pre-send PII Guard"| G2
+    G2 -->|"Deterministic Verifier + Draft PII Re-check"| G3["Gate 3: ApprovalLedger (ledger.sqlite3 WAL)"]
+    G3 -->|"FAIL / Missing Consent"| BLK["VERIFIED_BLOCKED"]
     G3 -->|"PASS + Consent"| PEND["PENDING_APPROVAL"]
-    PEND -->|"Human Review + HMAC Lease Bound to payload_sha256"| APPR["APPROVED (Single-Use Lease)"]
-    APPR -->|"Default mode: SIMULATED_NO_SEND"| SHAD["SHADOW_RECORDED (Zero External Bytes Sent)"]
-    APPR -->|"Explicit LOOPBACK_LIVE mode"| G4["Gate 4: MessageShieldDeliveryAdapter"]
-    G4 -->|"POST /inbox (Idempotency-Key)"| RX["LocalLoopbackReceiver (127.0.0.1 SQLite Inbox)"]
-    RX -->|"ACK OK"| DELIV["ACCEPTED_DELIVERY -> DELIVERED"]
-    RX -->|"Lost ACK / Crash"| UNK["UNKNOWN_DELIVERY (No Auto-POST Replay)"]
-    UNK -->|"GET /inbox/receipts/key"| DELIV
+    PEND -->|"Operator Console / REST API / CLI"| APPR["APPROVED (Single-Use HMAC Lease)"]
+    APPR -->|"SIMULATED_NO_SEND (Default)"| SHAD["SHADOW_RECORDED"]
+    APPR -->|"LOOPBACK_LIVE / LIVE"| G4["Gate 4: MessageShield + ChannelShieldTransport"]
+    G4 -->|"ACK"| DELIV["ACCEPTED_DELIVERY -> DELIVERED"]
+    G4 -->|"Uncertain / Lost ACK"| UNK["UNKNOWN_DELIVERY (No Blind Replay)"]
 ```
 
-## 2. Read-Only Dependency Boundaries
+## 2. Package & Module Boundaries
 
-- `tijaraguard/deps.py` sets `sys.dont_write_bytecode = True` before adding sibling repositories to `sys.path`, guaranteeing zero `.pyc` or `__pycache__` writes inside `bayan-gate`, `catalog-copilot`, or `message-shield`.
-- **Gate 1 ([tijaraguard/privacy.py](tijaraguard/privacy.py))**:
-  - Uses `RegionalPIIEngine` and `PIIRedactor`.
-  - Strips sensitive subfields (`formatted_iban`, `clean_number`) from `RedactionResult.to_dict(include_raw_spans=False)` via a strict `_SAFE_METADATA_KEYS` allowlist before storing `pii_summary_json` in SQLite.
-  - Replaces `raw_contact_target` with an irreversible keyed digest `ref-<16hex>`.
-  - Re-scans redacted outputs and outbound drafts for residual supported PII.
-- **Gate 2 ([tijaraguard/commerce.py](tijaraguard/commerce.py))**:
-  - Removes Gate 1 redaction placeholder tags before running `parse_dialectal_inquiry` and `FuzzyCatalogMatcher` so masked spans do not degrade Arabic product resolution.
-  - Binds `LeadInquiry` with `contact_channel="chat"` and `contact_target=envelope.contact_ref` so raw phone/email values never enter `CatalogCopilot`.
-  - Verifies drafts with `CommercialClaimVerifier` and re-checks privacy (`PRIVACY_LEAK_IN_DRAFT`).
-- **Gate 3 ([tijaraguard/ledger.py](tijaraguard/ledger.py))**:
-  - Uses SQLite WAL mode, `PRAGMA foreign_keys=ON`, `PRAGMA synchronous=FULL`, and `BEGIN IMMEDIATE` on all mutating transactions.
-  - Canonical payload binding (`compute_draft_payload_sha256` with `allow_nan=False`, `sort_keys=True`) prevents post-approval modification.
-  - HMAC-SHA256 `ApprovalToken` leases are single-use (`UPDATE approvals SET consumed=1 ... WHERE consumed=0 AND revoked=0`), time-bounded (`expires_at`), and revoked automatically upon `edit_draft` or detected payload/MAC mismatch (`APPROVAL_INVALIDATED_TAMPER`).
-  - `audit_events` enforces SQLite `BEFORE UPDATE` and `BEFORE DELETE` abort triggers and maintains a SHA-256 `prev_hash -> event_hash` chain verified via `verify_audit_chain()`.
-- **Gate 4 ([tijaraguard/delivery.py](tijaraguard/delivery.py))**:
-  - Uses `MessageShield` `Shield` (`admit`, `send`, `recover`, `receipt`, `get`).
-  - Rejects any endpoint outside literal loopback (`127.0.0.1`, `::1`).
-  - `LocalLoopbackReceiver` commits deduplicated rows into SQLite `inbox(key PRIMARY KEY, ...)` before replying HTTP 200 or injecting `drop_ack` connection shutdown.
+- `tijaraguard/deps.py`: Bytecode-safe dependency loader (`env_override -> sibling_repo -> vendored -> installed`) with SHA-256 `tijaraguard/_vendor/MANIFEST.json` verification.
+- `tijaraguard/security.py`: SSRF validation (`validate_outbound_url`), constant-time HMAC/API-key verification, replay window validation, `SlidingWindowRateLimiter`, CSV formula neutralization, secret/PII log filtering, and POSIX permission hardening.
+- `tijaraguard/config.py`: Dataclass configuration loader (`JSON + ENV`) and fail-closed startup validator.
+- `tijaraguard/providers/`: `OpenAICompatibleProvider`, `AnthropicProvider`, `GeminiProvider`, `OllamaProvider`, `HardenedJSONHttpClient` (no redirects), and `ModelRouter` (complexity tier routing, pre-send PII guard, observable fallback, usage accounting).
+- `tijaraguard/channels/`: `WhatsAppCloudAdapter`, `TelegramBotAdapter`, `ChatwootAdapter`, `GenericWebhookAdapter`, `ChannelShieldTransport`, and `ChannelRegistry`.
+- `tijaraguard/privacy.py` & `tijaraguard/commerce.py`: Gate 1 (`BayanGate`) and Gate 2 (`CatalogCopilot`) adapters.
+- `tijaraguard/ledger.py`: Schema v2 SQLite WAL ledger (`drafts`, `approvals`, `audit_events`, `channel_events`, `provider_usage`, `schema_migrations`), safe v1->v2 migration, hot backup/restore, retention purge, and separate `EphemeralRouteStore`.
+- `tijaraguard/pipeline.py` & `tijaraguard/runtime.py`: End-to-end 4-gate orchestration and dependency injection.
+- `tijaraguard/api.py`, `tijaraguard/web/index.html`, `tijaraguard/cli.py`: Authenticated REST API, webhook endpoints, lightweight RTL/LTR operator dashboard, and full CLI.
 
-## 3. Threat Model & Mitigations
+## 3. Honesty & Verification Boundaries
 
-| Threat | Mitigation | Verification |
-| --- | --- | --- |
-| Raw PII leaked in SQLite, logs, or exceptions | BayanGate pre-persistence redaction, metadata allowlist scrubbing, opaque `contact_ref`, PII-free exceptions | `test_gate1_privacy.py` & `audit_zero_pii()` |
-| LLM price/discount/warranty/stock hallucinations | Deterministic `CommercialClaimVerifier` whitelist + consent & expiry enforcement | `test_gate2_commerce.py` |
-| Bypassing human review or unsolicited messaging | Shadow Mode default (`SIMULATED_NO_SEND`), strict consent parser (`"false"` -> `False`), `PENDING_APPROVAL` gating | `test_gate2_commerce.py` & `test_gate3_approval.py` |
-| Post-approval payload tampering or token replay | Canonical SHA-256 + HMAC-SHA256 lease check, atomic `consumed=0 -> 1` SQL update, tamper revocation | `test_gate3_approval.py` |
-| Audit log tampering | `audit_events` SQLite triggers (`RAISE(ABORT)`) + SHA-256 hash chain verification | `test_gate3_approval.py` & `verify-audit` |
-| Duplicate customer delivery after lost ACK or crash | `MessageShield` `UNKNOWN` state prevents blind POST replay; read-only `GET /inbox/receipts/<key>` recovery + SQLite `PRIMARY KEY(key)` inbox | `test_gate4_delivery.py` |
-| SSRF / accidental live external messaging | Shadow default + literal loopback restriction (`127.0.0.1` / `::1`) | `test_gate4_delivery.py` |
-
-## 4. Residual Limitations & Non-Claims
-
-1. Not a production multi-tenant server or public HTTP API (no TLS termination, key rotation, or encryption-at-rest).
-2. Does NOT guarantee universal exactly-once delivery on arbitrary remote gateways (requires receiver idempotency and truthful receipt readback).
-3. Does NOT redact unstructured free-text Arabic person names or dates of birth (`UNSUPPORTED_ENTITY_TYPES` in `BayanGate`).
-4. Does NOT call external LLMs, WhatsApp Business APIs, Chatwoot servers, or remote hosts.
+- Automated tests verify all AI providers and messaging channels against real local `ThreadingHTTPServer` protocol endpoints using synthetic data only.
+- Live external API calls (OpenAI, Anthropic, Gemini, Meta WhatsApp Cloud, Telegram Bot API, live Chatwoot servers) require real operator credentials and remain `NOT_TESTED` in this offline/sandboxed environment.

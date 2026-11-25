@@ -1,0 +1,69 @@
+{
+  "dependencies": {
+    "bayan_gate": {
+      "files": {
+        "bayan_gate/LICENSE": "b5022626f5798ac258863596e595fed5f35025ab38e12cb707a9232c85919071",
+        "bayan_gate/THIRD_PARTY_NOTICES.md": "9e63b8c108f20a7c3ebc6772f0930b1c7fa4ddd940aaf44ad9b0f45884048b72",
+        "bayan_gate/bayan_gate/__init__.py": "e9e4379d0a639242ffd232278d8a5d495508e673970cd73ec9d25030eec3d720",
+        "bayan_gate/bayan_gate/cli.py": "fd2af4eb885cb43e65ad6cbbea71e93c9bee6eff75b5528e45f75ead34e89a06",
+        "bayan_gate/bayan_gate/demo.py": "ca38b572aa9956ea0ca9e313e3f000f4588291b8681f0d6ca5908986ec95eb4d",
+        "bayan_gate/bayan_gate/engine.py": "65b96740034072d71e82586be76437b0d4a0cb53914a2ccd36c59f38bb68e8de",
+        "bayan_gate/bayan_gate/matchers.py": "4799f71cb43509c46670316e9ab65f23c7154645e1e573e6788e193799cd9212",
+        "bayan_gate/bayan_gate/models.py": "5e649468e97c20312cb95cabcc06b2df4ccea4b1abcc1514ea8e8ec7224706c1",
+        "bayan_gate/bayan_gate/normalizer.py": "fd071ea66f81efba633125b86bbc1719f0f407fe950d712b5b7136de5e531d98",
+        "bayan_gate/bayan_gate/redactor.py": "77a6de29a8a5005a115c1091ff5fdb74a6032c63cd6c4257f2a3c6453bd2cb9d"
+      },
+      "license": "MIT",
+      "name": "bayan-gate",
+      "pinned_commit": "1d6b83a46cb75484a434efe17be2e7d97885050c",
+      "upstream_repo_url": "https://github.com/j0581233919-creator/bayan-gate",
+      "version": "1.0.1"
+    },
+    "catalog_copilot": {
+      "files": {
+        "catalog_copilot/LICENSE": "a60c2274d4ad627120ffac10526df97508b270c06596ea1ac8b8f863e4b0eedb",
+        "catalog_copilot/THIRD_PARTY_NOTICES.md": "a618571f72ed75e5b9d68ed1b8f460b77bfd46b15759f5db252cd5f936bf7dad",
+        "catalog_copilot/catalog_copilot/__init__.py": "136458263f3aad23a27208c699acede8c3426bea6515e1d0611a49b256b80c53",
+        "catalog_copilot/catalog_copilot/approval.py": "38267f1641fe1a46d1d1ccb2b9b4fad9abb4eb8b6bd6e15b8656748fb5dc7657",
+        "catalog_copilot/catalog_copilot/audit.py": "8e9815bc9de1fdef58f378bbb0bfc44433fce94d552ae1f7f23adee94928fe8d",
+        "catalog_copilot/catalog_copilot/catalog.py": "e42eaaf9b0590a2f62bc15ca50c801d6ce45eae4728372ec1df49a1574f2808e",
+        "catalog_copilot/catalog_copilot/chatwoot.py": "909980bd1c2b188269ffd65708306405ba320342e11876fefe6cd4a9da4cb654",
+        "catalog_copilot/catalog_copilot/cli.py": "ca2209919d99449d8fcea6970532edf38bb4d49fe83663b746c91ff199abe21e",
+        "catalog_copilot/catalog_copilot/csv_security.py": "4a7c7deda085b9d19b4a81eedda3adecb30045ef9b62c90905713532f1499cb7",
+        "catalog_copilot/catalog_copilot/dialect.py": "cea7f3f7229b4d2d2eb9c8e8ba67202135e1d49dcfb2bd11ce8837825d16bf7c",
+        "catalog_copilot/catalog_copilot/fuzzy.py": "d84af528c70d68b60ac0e5987ef1386dd429cebc6eefdeedb46243c2730185ae",
+        "catalog_copilot/catalog_copilot/generator.py": "3ab0a62bbdb655fe8a45c2ba29ec24425d560446116028119504e1c8d7dea9d0",
+        "catalog_copilot/catalog_copilot/models.py": "7e1b9e68e58d4fc6bedb665e03b39f8278256ed84b0ed61a16f520ec3c7bf4f4",
+        "catalog_copilot/catalog_copilot/rate_limiter.py": "da5aba567667402460fa9bb182f3753c674f26335771b8b8567d8bb221bb8375",
+        "catalog_copilot/catalog_copilot/tui.py": "afdb5616bda7c96c9c2cf30d4baa4613f9660644dd53ac6e5580921ee2be4130",
+        "catalog_copilot/catalog_copilot/verifier.py": "f7266443312600603eae77d822cc59ae8d5168deb8066075134dc3327c7ff0b2",
+        "catalog_copilot/catalog_copilot/workflow.py": "1a293792449a5b1be40367d9e49db9e3d202e3cd18cebd4ec7709e24e3322ddb"
+      },
+      "license": "MIT",
+      "name": "catalog-copilot",
+      "pinned_commit": "12522d3b17767ae9a4766499b6495fd4231ebcfc",
+      "upstream_repo_url": "https://github.com/j0581233919-creator/catalog-copilot",
+      "version": "1.0.1"
+    },
+    "message_shield": {
+      "files": {
+        "message_shield/LICENSE": "ba9b97c725fc82b2dd11bd112b5b77b700bed69036ffb5563a440a7373985a23",
+        "message_shield/THIRD_PARTY_NOTICES.md": "1c73b6437a93e2c7f02cec3ec0154f2038a67b90748024dd7f7d6168119dac8f",
+        "message_shield/examples/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "message_shield/examples/local_receiver.py": "6b06bc3cc9f1d3c1e8152231ed933886b08235be4187e2f9b06c3670e650bf1f",
+        "message_shield/message_shield/__init__.py": "f02f51c812aaeff994af9eddf46c259ad3201717cecb04f1e152240e1f6f5dd8",
+        "message_shield/message_shield/__main__.py": "ff97ede46c3e764475a051e24ee657c7d67264a4cea94d255e7a299859ea3785",
+        "message_shield/message_shield/engine.py": "56499d8d5b833acca582528481c4ff0e587cd00647dc8f1fd4ee6f488cbed59c",
+        "message_shield/message_shield/http.py": "e76897b173fa9c1016153c8039a68a9242a500090341008d1a48335e9959b0b3",
+        "message_shield/message_shield/model.py": "c7485547328459da007f0bd3499e388487c581dd6af4642bf14eabfad2a9221c",
+        "message_shield/message_shield/store.py": "594f0f5472442ab495b66eea53cf57b62a886b3f185b5de8cd583b09226fa908",
+        "message_shield/message_shield/transport.py": "0fe34ecbe11e2c220199e61afeb1f93ef3e1ccb02bfc1c9bc57b247a2bd2f55e"
+      },
+      "license": "MIT",
+      "name": "message-shield",
+      "pinned_commit": "4ccbc2641c18b47a9feadbe41010a06fb2791275",
+      "upstream_repo_url": "https://github.com/j0581233919-creator/message-shield",
+      "version": "0.1.0"
+    }
+  }
+}

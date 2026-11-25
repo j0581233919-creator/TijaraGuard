@@ -127,7 +127,7 @@ class TestGate1Privacy(unittest.TestCase):
                     conversation_id="conv-bad",
                     customer_handle="cust",
                     raw_contact_target=SYNTH_EMAIL,
-                    contact_channel="telegram",
+                    contact_channel="unsupported_channel",
                     consent_to_contact=True,
                     consent_evidence="none",
                     preferred_language="ar",

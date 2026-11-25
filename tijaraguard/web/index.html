@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TijaraGuard Operator Console</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --info: #a855f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.45;
+    }
+    header {
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+      padding: 14px 20px; background: #020617; border-bottom: 1px solid var(--border);
+    }
+    .brand { font-weight: 700; font-size: 1.1rem; color: var(--accent); }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    input, select, textarea, button {
+      background: #0f172a; color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; font-size: 0.9rem;
+    }
+    button { cursor: pointer; background: #0369a1; border-color: #0284c7; font-weight: 600; }
+    button.secondary { background: var(--panel); border-color: var(--border); }
+    button.danger { background: #991b1b; border-color: #dc2626; }
+    button.ok { background: #15803d; border-color: #22c55e; }
+    main { padding: 18px 20px; display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 14px; grid-column: span 12;
+    }
+    @media (min-width: 960px) {
+      .col-4 { grid-column: span 4; }
+      .col-6 { grid-column: span 6; }
+      .col-8 { grid-column: span 8; }
+    }
+    h2 { margin: 0 0 10px 0; font-size: 1rem; color: var(--accent); }
+    .grid-stats { display: flex; flex-wrap: wrap; gap: 10px; }
+    .stat { background: #0f172a; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); min-width: 120px; }
+    .stat .label { font-size: 0.75rem; color: var(--muted); }
+    .stat .val { font-size: 1.05rem; font-weight: 700; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 700;
+    }
+    .b-PENDING_APPROVAL { background: #78350f; color: #fde68a; }
+    .b-APPROVED { background: #14532d; color: #bbf7d0; }
+    .b-REJECTED, .b-VERIFIED_BLOCKED, .b-FAILED_DELIVERY { background: #7f1d1d; color: #fecaca; }
+    .b-UNKNOWN_DELIVERY, .b-ESCALATED { background: #581c87; color: #e9d5ff; }
+    .b-DELIVERED, .b-ACCEPTED_DELIVERY, .b-SHADOW_RECORDED { background: #0c4a6e; color: #bae6fd; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .rtl { direction: rtl; text-align: right; unicode-bidi: plaintext; }
+    pre {
+      background: #020617; padding: 10px; border-radius: 8px; overflow: auto;
+      max-height: 220px; font-size: 0.8rem; border: 1px solid var(--border);
+    }
+    .row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .muted { color: var(--muted); font-size: 0.82rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">TijaraGuard Operator Console</div>
+    <div class="controls">
+      <input id="apiKeyInput" type="password" placeholder="Operator API Key (TIJARAGUARD_API_KEY)" size="28" />
+      <input id="reviewerInput" type="text" value="supervisor_operator" placeholder="Reviewer ID" size="18" />
+      <button onclick="saveAuthAndRefresh()">Connect / Refresh</button>
+      <button class="secondary" onclick="toggleDir()">RTL / LTR</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card col-6">
+      <h2>1. System Status &amp; Audit Integrity</h2>
+      <div id="statusStats" class="grid-stats"><span class="muted">Connect with Operator API key to load live state.</span></div>
+      <div class="row-actions">
+        <button class="secondary" onclick="checkProvidersHealth()">Run Provider Health Checks</button>
+        <button class="secondary" onclick="runBackup()">Backup Ledger</button>
+        <button class="secondary" onclick="downloadAuditCsv()">Export Audit CSV</button>
+      </div>
+    </section>
+
+    <section class="card col-6">
+      <h2>2. Providers, Usage &amp; Channels</h2>
+      <div id="infraPanel" class="muted">Not loaded yet.</div>
+    </section>
+
+    <section class="card col-4">
+      <h2>3. Catalog Lookup &amp; New Inquiry</h2>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <input id="catalogQuery" type="text" placeholder="Search SKU / Arabic query..." style="flex:1;" />
+        <button onclick="searchCatalog()">Lookup</button>
+      </div>
+      <div id="catalogResult" class="muted" style="margin-bottom:10px;"></div>
+      <hr style="border-color:var(--border);" />
+      <div style="display:grid; gap:6px; margin-top:8px;">
+        <input id="inqCustomer" type="text" placeholder="Customer handle" value="عميل_تجريبي" />
+        <input id="inqTarget" type="text" placeholder="Contact target" value="+966500000000" />
+        <select id="inqChannel">
+          <option value="whatsapp">whatsapp</option>
+          <option value="telegram">telegram</option>
+          <option value="chatwoot">chatwoot</option>
+          <option value="webhook">webhook</option>
+          <option value="chat">chat</option>
+        </select>
+        <select id="inqLang">
+          <option value="ar">ar</option>
+          <option value="en">en</option>
+        </select>
+        <input id="inqEvidence" type="text" value="operator_console_opt_in" placeholder="Consent evidence" />
+        <label><input id="inqConsent" type="checkbox" checked /> Consent to contact</label>
+        <textarea id="inqText" rows="3" class="rtl" placeholder="اكتب استفسار العميل..."></textarea>
+        <button onclick="submitInquiry()">Process Through 4 Gates</button>
+      </div>
+    </section>
+
+    <section class="card col-8">
+      <h2>4. Drafts &amp; Human Approval Queue</h2>
+      <div class="controls" style="margin-bottom:8px;">
+        <select id="stateFilter" onchange="loadDrafts()">
+          <option value="">All States</option>
+          <option value="PENDING_APPROVAL">PENDING_APPROVAL</option>
+          <option value="APPROVED">APPROVED</option>
+          <option value="VERIFIED_BLOCKED">VERIFIED_BLOCKED</option>
+          <option value="ESCALATED">ESCALATED</option>
+          <option value="UNKNOWN_DELIVERY">UNKNOWN_DELIVERY</option>
+          <option value="DELIVERED">DELIVERED</option>
+          <option value="SHADOW_RECORDED">SHADOW_RECORDED</option>
+          <option value="REJECTED">REJECTED</option>
+          <option value="FAILED_DELIVERY">FAILED_DELIVERY</option>
+        </select>
+        <button class="secondary" onclick="loadDrafts()">Reload Drafts</button>
+      </div>
+      <div style="overflow:auto; max-height:320px;">
+        <table>
+          <thead>
+            <tr><th>Draft</th><th>Channel</th><th>SKU</th><th>AI</th><th>State</th><th>Action</th></tr>
+          </thead>
+          <tbody id="draftsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card col-6">
+      <h2>5. Selected Draft Inspector &amp; Actions</h2>
+      <div id="draftInspector" class="muted">Select a draft above to review, edit, approve, reject, escalate, dispatch, or recover.</div>
+    </section>
+
+    <section class="card col-6">
+      <h2>6. Audit History</h2>
+      <pre id="auditOutput">[]</pre>
+    </section>
+  </main>
+
+  <script>
+    const keyInput = document.getElementById("apiKeyInput");
+    keyInput.value = sessionStorage.getItem("tg_api_key") || "";
+
+    function headers() {
+      const k = keyInput.value.trim();
+      const h = { "Content-Type": "application/json" };
+      if (k) h["Authorization"] = "Bearer " + k;
+      return h;
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+      const ct = res.headers.get("content-type") || "";
+      const body = ct.includes("application/json") ? await res.json() : await res.text();
+      if (!res.ok) throw new Error(typeof body === "string" ? body : JSON.stringify(body));
+      return body;
+    }
+
+    function toggleDir() {
+      document.documentElement.dir = document.documentElement.dir === "rtl" ? "ltr" : "rtl";
+    }
+
+    async function saveAuthAndRefresh() {
+      sessionStorage.setItem("tg_api_key", keyInput.value.trim());
+      await refreshAll();
+    }
+
+    async function refreshAll() {
+      try {
+        const [st, usage, drafts] = await Promise.all([
+          api("/api/v1/status"),
+          api("/api/v1/usage"),
+          api("/api/v1/drafts" + (document.getElementById("stateFilter").value ? "?state=" + encodeURIComponent(document.getElementById("stateFilter").value) : ""))
+        ]);
+        renderStatus(st, usage);
+        renderDrafts(drafts.drafts || []);
+      } catch (err) {
+        document.getElementById("statusStats").innerHTML = `<span style="color:var(--bad)">Error: ${escapeHtml(err.message)}</span>`;
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    function renderStatus(st, usage) {
+      const sc = st.state_counts || {};
+      document.getElementById("statusStats").innerHTML = `
+        <div class="stat"><div class="label">Mode</div><div class="val">${escapeHtml(st.mode)}</div></div>
+        <div class="stat"><div class="label">Audit Chain</div><div class="val">${st.audit_chain_valid ? "VALID" : "INVALID"}</div></div>
+        <div class="stat"><div class="label">Pending</div><div class="val">${sc.PENDING_APPROVAL || 0}</div></div>
+        <div class="stat"><div class="label">Approved</div><div class="val">${sc.APPROVED || 0}</div></div>
+        <div class="stat"><div class="label">Delivered</div><div class="val">${sc.DELIVERED || 0}</div></div>
+        <div class="stat"><div class="label">Unknown</div><div class="val">${sc.UNKNOWN_DELIVERY || 0}</div></div>
+      `;
+      document.getElementById("infraPanel").innerHTML = `
+        <div><strong>Providers:</strong> ${escapeHtml(JSON.stringify((st.providers || {}).providers || []))}</div>
+        <div><strong>Routing:</strong> ${escapeHtml(JSON.stringify((st.providers || {}).routing || {}))}</div>
+        <div><strong>Usage:</strong> calls=${usage.total_calls || 0}, tokens=${usage.total_tokens || 0}, est_usd=${usage.estimated_cost_usd || 0}</div>
+        <div><strong>Channels:</strong> ${escapeHtml(JSON.stringify(st.channels || {}))}</div>
+      `;
+    }
+
+    function renderDrafts(list) {
+      const tb = document.getElementById("draftsBody");
+      tb.innerHTML = list.map(d => `
+        <tr>
+          <td><code>${escapeHtml(d.draft_id)}</code></td>
+          <td>${escapeHtml(d.contact_channel)}</td>
+          <td>${escapeHtml(d.sku || "-")}</td>
+          <td>${escapeHtml(d.ai_provider || "-")}</td>
+          <td><span class="badge b-${escapeHtml(d.state)}">${escapeHtml(d.state)}</span></td>
+          <td><button class="secondary" onclick="inspectDraft('${escapeHtml(d.draft_id)}')">Inspect</button></td>
+        </tr>
+      `).join("");
+    }
+
+    async function loadDrafts() {
+      const f = document.getElementById("stateFilter").value;
+      const res = await api("/api/v1/drafts" + (f ? "?state=" + encodeURIComponent(f) : ""));
+      renderDrafts(res.drafts || []);
+    }
+
+    async function inspectDraft(draftId) {
+      const data = await api("/api/v1/drafts/" + encodeURIComponent(draftId));
+      const d = data.draft;
+      document.getElementById("auditOutput").textContent = JSON.stringify(data.audit_events || [], null, 2);
+      document.getElementById("draftInspector").innerHTML = `
+        <div><strong>${escapeHtml(d.draft_id)}</strong> | <span class="badge b-${escapeHtml(d.state)}">${escapeHtml(d.state)}</span> | Verification: <strong>${escapeHtml(d.verification_status)}</strong></div>
+        <div class="muted">Channel: ${escapeHtml(d.contact_channel)} | ContactRef: ${escapeHtml(d.contact_ref)} | SHA256: <code>${escapeHtml(d.payload_sha256)}</code></div>
+        <p><strong>Redacted Inquiry:</strong></p>
+        <pre class="rtl">${escapeHtml(d.redacted_inquiry)}</pre>
+        <p><strong>Draft Body (Editable):</strong></p>
+        <textarea id="editBodyBox" rows="5" style="width:100%;" class="rtl">${escapeHtml(d.body)}</textarea>
+        <div class="row-actions">
+          <button class="secondary" onclick="editDraft('${escapeHtml(d.draft_id)}')">Save &amp; Re-Verify</button>
+          <button class="ok" onclick="approveDraft('${escapeHtml(d.draft_id)}', '${escapeHtml(d.payload_sha256)}')">Approve</button>
+          <button onclick="dispatchDraft('${escapeHtml(d.draft_id)}')">Dispatch</button>
+          <button class="secondary" onclick="recoverDraft('${escapeHtml(d.draft_id)}')">Recover</button>
+          <button class="secondary" onclick="escalateDraft('${escapeHtml(d.draft_id)}')">Escalate</button>
+          <button class="danger" onclick="rejectDraft('${escapeHtml(d.draft_id)}')">Reject</button>
+        </div>
+      `;
+    }
+
+    async function searchCatalog() {
+      const q = document.getElementById("catalogQuery").value.trim();
+      const res = await api("/api/v1/catalog/search?q=" + encodeURIComponent(q));
+      document.getElementById("catalogResult").textContent = JSON.stringify(res);
+    }
+
+    async function submitInquiry() {
+      const payload = {
+        customer_handle: document.getElementById("inqCustomer").value,
+        raw_contact_target: document.getElementById("inqTarget").value,
+        contact_channel: document.getElementById("inqChannel").value,
+        preferred_language: document.getElementById("inqLang").value,
+        consent_evidence: document.getElementById("inqEvidence").value,
+        consent_to_contact: document.getElementById("inqConsent").checked,
+        raw_text: document.getElementById("inqText").value,
+      };
+      const res = await api("/api/v1/inquiries", { method: "POST", body: JSON.stringify(payload) });
+      await refreshAll();
+      await inspectDraft(res.draft_id);
+    }
+
+    async function editDraft(id) {
+      await api(`/api/v1/drafts/${encodeURIComponent(id)}/edit`, {
+        method: "POST",
+        body: JSON.stringify({ new_body: document.getElementById("editBodyBox").value, actor: document.getElementById("reviewerInput").value })
+      });
+      await refreshAll();
+      await inspectDraft(id);
+    }
+
+    async function approveDraft(id, sha) {
+      await api(`/api/v1/drafts/${encodeURIComponent(id)}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ reviewer_id: document.getElementById("reviewerInput").value, expected_payload_sha256: sha })
+      });
+      await refreshAll();
+      await inspectDraft(id);
+    }
+
+    async function dispatchDraft(id) {
+      await api(`/api/v1/drafts/${encodeURIComponent(id)}/dispatch`, { method: "POST", body: "{}" });
+      await refreshAll();
+      await inspectDraft(id);
+    }
+
+    async function recoverDraft(id) {
+      await api(`/api/v1/drafts/${encodeURIComponent(id)}/recover`, { method: "POST", body: "{}" });
+      await refreshAll();
+      await inspectDraft(id);
+    }
+
+    async function escalateDraft(id) {
+      await api(`/api/v1/drafts/${encodeURIComponent(id)}/escalate`, {
+        method: "POST",
+        body: JSON.stringify({ actor: document.getElementById("reviewerInput").value, reason: "operator_escalated" })
+      });
+      await refreshAll();
+      await inspectDraft(id);
+    }
+
+    async function rejectDraft(id) {
+      await api(`/api/v1/drafts/${encodeURIComponent(id)}/reject`, {
+        method: "POST",
+        body: JSON.stringify({ reviewer_id: document.getElementById("reviewerInput").value, reason: "operator_rejected" })
+      });
+      await refreshAll();
+      await inspectDraft(id);
+    }
+
+    async function checkProvidersHealth() {
+      const res = await api("/api/v1/providers/health", { method: "POST", body: "{}" });
+      alert(JSON.stringify(res.results, null, 2));
+    }
+
+    async function runBackup() {
+      const res = await api("/api/v1/maintenance/backup", { method: "POST", body: "{}" });
+      alert("Backup created: " + res.backup_path + "\nSHA256: " + res.sha256);
+    }
+
+    async function downloadAuditCsv() {
+      const res = await fetch("/api/v1/audit/export.csv", { headers: headers() });
+      const text = await res.text();
+      const blob = new Blob([text], { type: "text/csv" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "tijaraguard_audit.csv";
+      a.click();
+    }
+  </script>
+</body>
+</html>

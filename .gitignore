@@ -11,3 +11,8 @@ dist/
 build/
 *.egg-info/
 .coverage
+.env
+*.env
+!.env.example
+*.log
+backups/

@@ -1,63 +1,65 @@
-"""TijaraGuard isolated integration MVP package."""
+"""TijaraGuard commercial customer-support & sales-assistance platform."""
 
 from __future__ import annotations
 
+import importlib
 import sys
+from typing import Any
 
-# Must execute prior to importing read-only sibling repositories.
+# Must execute prior to importing external/sibling repositories.
 sys.dont_write_bytecode = True
 
-from .commerce import CommercialGate
-from .delivery import LocalLoopbackReceiver, MessageShieldDeliveryAdapter
-from .deps import DependencyBundle, inspect_dependencies, load_dependencies
-from .ledger import ApprovalLedger
-from .models import (
-    ApprovalAlreadyConsumedError,
-    ApprovalExpiredError,
-    ApprovalRequiredError,
-    ApprovalTamperError,
-    ApprovalToken,
-    CommercialEvaluation,
-    DeliveryError,
-    DispatchOutcome,
-    DraftState,
-    ExecutionMode,
-    InboundMessage,
-    MalformedInputError,
-    PrivacyViolationError,
-    RedactedEnvelope,
-    TijaraGuardError,
-    VerificationBlockedError,
-)
-from .pipeline import TijaraGuardPipeline
-from .privacy import PrivacyGate
+__version__ = "0.2.0b1"
 
-__version__ = "0.1.0"
+_EXPORTS = {
+    "ApprovalAlreadyConsumedError": ("models", "ApprovalAlreadyConsumedError"),
+    "ApprovalExpiredError": ("models", "ApprovalExpiredError"),
+    "ApprovalLedger": ("ledger", "ApprovalLedger"),
+    "ApprovalRequiredError": ("models", "ApprovalRequiredError"),
+    "ApprovalTamperError": ("models", "ApprovalTamperError"),
+    "ApprovalToken": ("models", "ApprovalToken"),
+    "ChannelError": ("models", "ChannelError"),
+    "CommercialEvaluation": ("models", "CommercialEvaluation"),
+    "CommercialGate": ("commerce", "CommercialGate"),
+    "DeliveryError": ("models", "DeliveryError"),
+    "DependencyBundle": ("deps", "DependencyBundle"),
+    "DispatchOutcome": ("models", "DispatchOutcome"),
+    "DraftState": ("models", "DraftState"),
+    "EphemeralRouteStore": ("ledger", "EphemeralRouteStore"),
+    "ExecutionMode": ("models", "ExecutionMode"),
+    "InboundMessage": ("models", "InboundMessage"),
+    "LocalLoopbackReceiver": ("delivery", "LocalLoopbackReceiver"),
+    "MalformedInputError": ("models", "MalformedInputError"),
+    "MessageShieldDeliveryAdapter": ("delivery", "MessageShieldDeliveryAdapter"),
+    "PrivacyGate": ("privacy", "PrivacyGate"),
+    "PrivacyViolationError": ("models", "PrivacyViolationError"),
+    "ProviderError": ("models", "ProviderError"),
+    "RedactedEnvelope": ("models", "RedactedEnvelope"),
+    "TijaraGuardConfig": ("config", "TijaraGuardConfig"),
+    "TijaraGuardError": ("models", "TijaraGuardError"),
+    "TijaraGuardHTTPServer": ("api", "TijaraGuardHTTPServer"),
+    "TijaraGuardPipeline": ("pipeline", "TijaraGuardPipeline"),
+    "VerificationBlockedError": ("models", "VerificationBlockedError"),
+    "build_channel_registry": ("runtime", "build_channel_registry"),
+    "build_grounded_ai_callable": ("commerce", "build_grounded_ai_callable"),
+    "build_pipeline_from_config": ("runtime", "build_pipeline_from_config"),
+    "inspect_dependencies": ("deps", "inspect_dependencies"),
+    "load_config": ("config", "load_config"),
+    "load_dependencies": ("deps", "load_dependencies"),
+    "restore_ledger_backup": ("ledger", "restore_ledger_backup"),
+    "validate_config": ("config", "validate_config"),
+    "verify_vendor_manifest": ("deps", "verify_vendor_manifest"),
+}
 
-__all__ = [
-    "ApprovalAlreadyConsumedError",
-    "ApprovalExpiredError",
-    "ApprovalLedger",
-    "ApprovalRequiredError",
-    "ApprovalTamperError",
-    "ApprovalToken",
-    "CommercialEvaluation",
-    "CommercialGate",
-    "DeliveryError",
-    "DependencyBundle",
-    "DispatchOutcome",
-    "DraftState",
-    "ExecutionMode",
-    "InboundMessage",
-    "LocalLoopbackReceiver",
-    "MalformedInputError",
-    "MessageShieldDeliveryAdapter",
-    "PrivacyGate",
-    "PrivacyViolationError",
-    "RedactedEnvelope",
-    "TijaraGuardError",
-    "TijaraGuardPipeline",
-    "VerificationBlockedError",
-    "inspect_dependencies",
-    "load_dependencies",
-]
+__all__ = sorted([*list(_EXPORTS.keys()), "__version__"])
+
+
+def __getattr__(name: str) -> Any:
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    mod_name, attr_name = target
+    mod = importlib.import_module(f".{mod_name}", __name__)
+    val = getattr(mod, attr_name)
+    globals()[name] = val
+    return val
