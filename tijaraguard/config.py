@@ -204,6 +204,9 @@ class TijaraGuardConfig:
         for p in self.providers.values():
             if p.api_key:
                 vals.append(p.api_key)
+            for hv in p.extra_headers.values():
+                if isinstance(hv, str) and len(hv) >= 4:
+                    vals.append(hv)
         for val in (
             self.channels.whatsapp.access_token,
             self.channels.whatsapp.verify_token,
@@ -273,8 +276,39 @@ def _parse_mode(raw: str) -> ExecutionMode:
     raise MalformedInputError(f"Unsupported ExecutionMode '{raw}'.")
 
 
+def _parse_int(raw: Any, field_name: str, *, default: Optional[int] = None) -> int:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        if default is not None:
+            return default
+        raise MalformedInputError(f"Field '{field_name}' must be an integer.")
+    if isinstance(raw, bool):
+        raise MalformedInputError(f"Field '{field_name}' must be an integer, not boolean.")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        try:
+            return int(s)
+        except ValueError as exc:
+            raise MalformedInputError(f"Field '{field_name}' must be a valid integer.") from exc
+    raise MalformedInputError(f"Field '{field_name}' must be an integer.")
+
+
 def _default_repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    pkg_parent = Path(__file__).resolve().parents[1]
+    if (pkg_parent / "pyproject.toml").is_file() or (pkg_parent / "examples").is_dir():
+        return pkg_parent
+    return Path.cwd()
+
+
+def _default_catalog_path(repo_root: Path) -> Path:
+    repo_cat = repo_root / "examples" / "catalog.json"
+    if repo_cat.is_file():
+        return repo_cat
+    cwd_cat = Path.cwd() / "examples" / "catalog.json"
+    if cwd_cat.is_file():
+        return cwd_cat
+    return Path(__file__).resolve().parent / "data" / "catalog.json"
 
 
 def load_config(
@@ -322,11 +356,10 @@ def load_config(
         or file_data.get("backup_dir")
         or str(state_dir / "backups")
     ).resolve()
-    catalog_path = Path(
-        env_map.get("TIJARAGUARD_CATALOG_PATH")
-        or file_data.get("catalog_path")
-        or str(repo_root / "examples" / "catalog.json")
-    ).resolve()
+    raw_cat = env_map.get("TIJARAGUARD_CATALOG_PATH") or file_data.get("catalog_path")
+    catalog_path = (
+        Path(raw_cat).resolve() if raw_cat else _default_catalog_path(repo_root).resolve()
+    )
 
     mode = _parse_mode(
         str(env_map.get("TIJARAGUARD_MODE") or file_data.get("mode") or ExecutionMode.SHADOW.value)
@@ -356,7 +389,11 @@ def load_config(
         or None
     )
     bind_host = str(env_map.get("TIJARAGUARD_HOST") or file_data.get("bind_host") or "127.0.0.1")
-    bind_port = int(env_map.get("TIJARAGUARD_PORT") or file_data.get("bind_port") or 8080)
+    raw_port = env_map.get("TIJARAGUARD_PORT")
+    if raw_port is None or not str(raw_port).strip():
+        raw_port = file_data.get("bind_port")
+    bind_port = _parse_int(raw_port, "bind_port", default=8080)
+
     loopback_endpoint = (
         env_map.get("TIJARAGUARD_LOOPBACK_RECEIVER_URL")
         or file_data.get("loopback_receiver_endpoint")
@@ -377,7 +414,6 @@ def load_config(
         "allow_loopback_channels",
     )
 
-    # Providers from JSON + env overlays for OpenAI, Groq, OpenRouter, Mistral, Anthropic, Gemini, Ollama
     providers: Dict[str, ProviderEndpointConfig] = {}
     raw_providers = file_data.get("providers") or {}
     if isinstance(raw_providers, dict):
@@ -396,7 +432,7 @@ def load_config(
                 api_key_env=key_env,
                 api_key=resolved_key,
                 timeout_seconds=float(pdata.get("timeout_seconds", 20.0)),
-                max_retries=int(pdata.get("max_retries", 2)),
+                max_retries=_parse_int(pdata.get("max_retries"), "max_retries", default=2),
                 extra_headers=dict(pdata.get("extra_headers") or {}),
                 input_cost_per_1k=pdata.get("input_cost_per_1k"),
                 output_cost_per_1k=pdata.get("output_cost_per_1k"),
@@ -412,10 +448,10 @@ def load_config(
         ("gemini", "gemini", "GEMINI_API_KEY", "GEMINI_BASE_URL", "GEMINI_MODEL", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.0-flash"),
     ]
     for name, kind, key_env, url_env, model_env, default_url, default_model in builtin_provider_specs:
-        api_key = env_map.get(key_env)
-        base_url = env_map.get(url_env)
-        model = env_map.get(model_env)
-        if name not in providers and (api_key or base_url or model):
+        api_key = (env_map.get(key_env) or "").strip() or None
+        base_url = (env_map.get(url_env) or "").strip() or None
+        model = (env_map.get(model_env) or "").strip() or None
+        if name not in providers and api_key:
             providers[name] = ProviderEndpointConfig(
                 name=name,
                 kind=kind,
@@ -423,7 +459,7 @@ def load_config(
                 base_url=base_url or default_url,
                 api_key_env=key_env,
                 api_key=api_key,
-                enabled=bool(api_key),
+                enabled=True,
             )
         elif name in providers:
             existing = providers[name]
@@ -442,9 +478,16 @@ def load_config(
                 enabled=existing.enabled,
             )
 
-    ollama_url = env_map.get("OLLAMA_BASE_URL")
-    ollama_model = env_map.get("OLLAMA_MODEL")
-    if "ollama" not in providers and (ollama_url or ollama_model):
+    # Ollama is strictly optional: only enable when OLLAMA_BASE_URL or OLLAMA_ENABLED=true is set
+    ollama_url = (env_map.get("OLLAMA_BASE_URL") or "").strip() or None
+    ollama_model = (env_map.get("OLLAMA_MODEL") or "").strip() or None
+    ollama_enabled_env = env_map.get("OLLAMA_ENABLED")
+    ollama_explicit = (
+        parse_bool_strict(ollama_enabled_env, "OLLAMA_ENABLED")
+        if ollama_enabled_env is not None and str(ollama_enabled_env).strip()
+        else bool(ollama_url)
+    )
+    if "ollama" not in providers and ollama_explicit:
         providers["ollama"] = ProviderEndpointConfig(
             name="ollama",
             kind="ollama",
@@ -452,10 +495,30 @@ def load_config(
             base_url=ollama_url or "http://127.0.0.1:11434",
             enabled=True,
         )
+    elif "ollama" in providers:
+        existing = providers["ollama"]
+        providers["ollama"] = ProviderEndpointConfig(
+            name=existing.name,
+            kind=existing.kind,
+            model=ollama_model or existing.model,
+            base_url=ollama_url or existing.base_url,
+            api_key_env=existing.api_key_env,
+            api_key=existing.api_key,
+            timeout_seconds=existing.timeout_seconds,
+            max_retries=existing.max_retries,
+            extra_headers=existing.extra_headers,
+            input_cost_per_1k=existing.input_cost_per_1k,
+            output_cost_per_1k=existing.output_cost_per_1k,
+            enabled=(
+                parse_bool_strict(ollama_enabled_env, "OLLAMA_ENABLED")
+                if ollama_enabled_env is not None and str(ollama_enabled_env).strip()
+                else existing.enabled
+            ),
+        )
 
     routing_raw = file_data.get("routing") or {}
     default_provider = (
-        env_map.get("TIJARAGUARD_DEFAULT_PROVIDER")
+        (env_map.get("TIJARAGUARD_DEFAULT_PROVIDER") or "").strip()
         or routing_raw.get("default_provider")
         or next((k for k, p in providers.items() if p.enabled), None)
     )
@@ -467,9 +530,9 @@ def load_config(
 
     tier_routes: Dict[str, str] = dict(routing_raw.get("tier_routes") or {})
     for tier in ("simple", "standard", "complex"):
-        env_tier = env_map.get(f"TIJARAGUARD_PROVIDER_{tier.upper()}")
+        env_tier = (env_map.get(f"TIJARAGUARD_PROVIDER_{tier.upper()}") or "").strip()
         if env_tier:
-            tier_routes[tier] = env_tier.strip()
+            tier_routes[tier] = env_tier
 
     routing = RoutingConfig(
         default_provider=default_provider,
@@ -572,33 +635,46 @@ def load_config(
     )
 
     ret_raw = file_data.get("retention") or {}
+    ret_days = _parse_int(
+        env_map.get("TIJARAGUARD_RETENTION_DAYS")
+        if env_map.get("TIJARAGUARD_RETENTION_DAYS") not in (None, "")
+        else ret_raw.get("inquiry_retention_days"),
+        "inquiry_retention_days",
+        default=30,
+    )
+    route_ttl = _parse_int(
+        env_map.get("TIJARAGUARD_ROUTE_TTL_SECONDS")
+        if env_map.get("TIJARAGUARD_ROUTE_TTL_SECONDS") not in (None, "")
+        else ret_raw.get("route_ttl_seconds"),
+        "route_ttl_seconds",
+        default=86400,
+    )
+    ev_ret_days = _parse_int(
+        env_map.get("TIJARAGUARD_CHANNEL_EVENT_RETENTION_DAYS")
+        if env_map.get("TIJARAGUARD_CHANNEL_EVENT_RETENTION_DAYS") not in (None, "")
+        else ret_raw.get("channel_event_retention_days"),
+        "channel_event_retention_days",
+        default=7,
+    )
     retention = RetentionConfig(
-        inquiry_retention_days=int(
-            env_map.get("TIJARAGUARD_RETENTION_DAYS")
-            or ret_raw.get("inquiry_retention_days")
-            or 30
-        ),
-        route_ttl_seconds=int(
-            env_map.get("TIJARAGUARD_ROUTE_TTL_SECONDS")
-            or ret_raw.get("route_ttl_seconds")
-            or 86400
-        ),
-        channel_event_retention_days=int(
-            env_map.get("TIJARAGUARD_CHANNEL_EVENT_RETENTION_DAYS")
-            or ret_raw.get("channel_event_retention_days")
-            or 7
-        ),
+        inquiry_retention_days=ret_days,
+        route_ttl_seconds=route_ttl,
+        channel_event_retention_days=ev_ret_days,
     )
 
-    rate_limit = int(
+    rate_limit = _parse_int(
         env_map.get("TIJARAGUARD_RATE_LIMIT_PER_MIN")
-        or file_data.get("rate_limit_per_minute")
-        or 120
+        if env_map.get("TIJARAGUARD_RATE_LIMIT_PER_MIN") not in (None, "")
+        else file_data.get("rate_limit_per_minute"),
+        "rate_limit_per_minute",
+        default=120,
     )
-    replay_window = int(
+    replay_window = _parse_int(
         env_map.get("TIJARAGUARD_WEBHOOK_REPLAY_WINDOW_SECONDS")
-        or file_data.get("webhook_replay_window_seconds")
-        or 300
+        if env_map.get("TIJARAGUARD_WEBHOOK_REPLAY_WINDOW_SECONDS") not in (None, "")
+        else file_data.get("webhook_replay_window_seconds"),
+        "webhook_replay_window_seconds",
+        default=300,
     )
 
     return TijaraGuardConfig(
@@ -691,22 +767,24 @@ def validate_config(cfg: TijaraGuardConfig) -> Dict[str, Any]:
                 p.base_url,
                 allow_loopback=allow_lb,
                 allow_http_loopback=allow_lb,
+                require_dns=False,
             )
         except SSRFError as exc:
             errors.append(f"Provider '{name}' URL rejected: {exc}")
 
-    if cfg.routing.default_provider and cfg.routing.default_provider not in cfg.providers:
-        errors.append(
-            f"routing.default_provider '{cfg.routing.default_provider}' is not configured."
-        )
-    for tier, pname in cfg.routing.tier_routes.items():
+    def _check_route_ref(label: str, pname: str) -> None:
         if pname not in cfg.providers:
-            errors.append(f"routing.tier_routes['{tier}'] references unknown provider '{pname}'.")
-    for pname in cfg.routing.fallback_chain:
-        if pname not in cfg.providers:
-            errors.append(f"routing.fallback_chain references unknown provider '{pname}'.")
+            errors.append(f"{label} '{pname}' is not configured.")
+        elif not cfg.providers[pname].enabled:
+            errors.append(f"{label} '{pname}' is disabled.")
 
-    # Channel completeness checks
+    if cfg.routing.default_provider:
+        _check_route_ref("routing.default_provider", cfg.routing.default_provider)
+    for tier, pname in cfg.routing.tier_routes.items():
+        _check_route_ref(f"routing.tier_routes['{tier}']", pname)
+    for pname in cfg.routing.fallback_chain:
+        _check_route_ref("routing.fallback_chain", pname)
+
     wa = cfg.channels.whatsapp
     if wa.enabled:
         if not wa.phone_number_id.strip():
@@ -720,6 +798,7 @@ def validate_config(cfg: TijaraGuardConfig) -> Dict[str, Any]:
                 wa.base_url,
                 allow_loopback=cfg.allow_loopback_channels,
                 allow_http_loopback=cfg.allow_loopback_channels,
+                require_dns=False,
             )
         except SSRFError as exc:
             errors.append(f"WhatsApp base_url rejected: {exc}")
@@ -735,6 +814,7 @@ def validate_config(cfg: TijaraGuardConfig) -> Dict[str, Any]:
                 tg.base_url,
                 allow_loopback=cfg.allow_loopback_channels,
                 allow_http_loopback=cfg.allow_loopback_channels,
+                require_dns=False,
             )
         except SSRFError as exc:
             errors.append(f"Telegram base_url rejected: {exc}")
@@ -753,21 +833,35 @@ def validate_config(cfg: TijaraGuardConfig) -> Dict[str, Any]:
                     cw.base_url,
                     allow_loopback=cfg.allow_loopback_channels,
                     allow_http_loopback=cfg.allow_loopback_channels,
+                    require_dns=False,
                 )
             except SSRFError as exc:
                 errors.append(f"Chatwoot base_url rejected: {exc}")
 
     wh = cfg.channels.webhook
     if wh.enabled:
+        if not (wh.inbound_secret and wh.inbound_secret.strip()):
+            warnings.append("Generic webhook enabled without TIJARAGUARD_WEBHOOK_INBOUND_SECRET; inbound webhooks will reject requests.")
         if wh.outbound_url.strip():
             try:
                 validate_outbound_url(
                     wh.outbound_url,
                     allow_loopback=cfg.allow_loopback_channels,
                     allow_http_loopback=cfg.allow_loopback_channels,
+                    require_dns=False,
                 )
             except SSRFError as exc:
                 errors.append(f"Generic webhook outbound_url rejected: {exc}")
+        if wh.receipt_lookup_url.strip():
+            try:
+                validate_outbound_url(
+                    wh.receipt_lookup_url,
+                    allow_loopback=cfg.allow_loopback_channels,
+                    allow_http_loopback=cfg.allow_loopback_channels,
+                    require_dns=False,
+                )
+            except SSRFError as exc:
+                errors.append(f"Generic webhook receipt_lookup_url rejected: {exc}")
 
     return {
         "valid": len(errors) == 0,

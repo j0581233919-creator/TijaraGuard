@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import json
 import socket
 import ssl
-import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
 from ..config import WhatsAppConfig
 from ..models import ChannelError
@@ -16,6 +15,7 @@ from ..security import (
     ReplayError,
     SSRFError,
     WebhookSignatureError,
+    open_validated_connection,
     scrub_secrets_from_text,
     validate_outbound_url,
     verify_hmac_sha256,
@@ -62,6 +62,7 @@ class WhatsAppCloudAdapter(ChannelAdapter):
                 base,
                 allow_loopback=self.allow_loopback,
                 allow_http_loopback=self.allow_loopback,
+                require_dns=False,
             )
         except SSRFError as exc:
             raise ChannelError(f"Invalid WhatsApp base_url: {exc}") from exc
@@ -73,8 +74,6 @@ class WhatsAppCloudAdapter(ChannelAdapter):
 
     def verify_challenge(self, query_params: Mapping[str, str]) -> str:
         """Handles Meta webhook GET verification challenge (hub.mode, hub.verify_token, hub.challenge)."""
-        import hmac
-
         verify_token = (self.config.verify_token or "").strip()
         if not verify_token:
             raise WebhookSignatureError("WhatsApp verify_token is not configured.")
@@ -182,11 +181,17 @@ class WhatsAppCloudAdapter(ChannelAdapter):
                     if not st_id or st_name not in ("sent", "delivered", "read", "failed"):
                         continue
                     try:
-                        ts = float(st.get("timestamp", time.time()))
-                    except (TypeError, ValueError):
-                        ts = time.time()
+                        ts = float(st.get("timestamp", 0))
+                    except (TypeError, ValueError) as exc:
+                        raise ReplayError("Invalid WhatsApp status timestamp.") from exc
+                    if not verify_timestamp_window(ts, max_skew_seconds=self.replay_window_seconds):
+                        raise ReplayError("WhatsApp status timestamp outside replay window.")
                     errors = st.get("errors") or []
-                    err_msg = str(errors[0].get("title")) if errors and isinstance(errors[0], dict) else None
+                    err_msg = (
+                        str(errors[0].get("title"))
+                        if errors and isinstance(errors[0], dict)
+                        else None
+                    )
                     status_events.append(
                         ChannelStatusEvent(
                             channel="whatsapp",
@@ -213,12 +218,15 @@ class WhatsAppCloudAdapter(ChannelAdapter):
         if not token or not self.phone_number_id:
             raise ChannelError("WhatsApp access_token or phone_number_id is not configured.")
 
-        url = validate_outbound_url(
-            self.endpoint_url,
-            allow_loopback=self.allow_loopback,
-            allow_http_loopback=self.allow_loopback,
-        )
-        parsed = urlsplit(url)
+        try:
+            conn, path, host_header = open_validated_connection(
+                self.endpoint_url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+            )
+        except SSRFError as exc:
+            raise ChannelError(f"WhatsApp endpoint blocked by SSRF policy: {exc}") from exc
+
         body = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -228,18 +236,13 @@ class WhatsAppCloudAdapter(ChannelAdapter):
         }
         raw_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {
+            "Host": host_header,
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Content-Length": str(len(raw_body)),
             "X-Idempotency-Key": idempotency_key,
             "Connection": "close",
         }
-
-        conn = (
-            http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-        )
         try:
             try:
                 conn.connect()
@@ -250,13 +253,17 @@ class WhatsAppCloudAdapter(ChannelAdapter):
                     uncertain=False,
                     error=scrub_secrets_from_text(str(exc), (token,)),
                 )
-            conn.request("POST", parsed.path, body=raw_body, headers=headers)
+            conn.request("POST", path, body=raw_body, headers=headers)
             resp = conn.getresponse()
             raw_resp = resp.read(65536)
             if resp.status in (200, 201):
                 data = json.loads(raw_resp.decode("utf-8")) if raw_resp else {}
                 msgs = data.get("messages") or []
-                ext_id = str(msgs[0].get("id")) if msgs and isinstance(msgs[0], dict) else idempotency_key[:32]
+                ext_id = (
+                    str(msgs[0].get("id") or idempotency_key[:32])
+                    if msgs and isinstance(msgs[0], dict)
+                    else idempotency_key[:32]
+                )
                 return OutboundSendResult(
                     accepted=True,
                     external_message_id=ext_id,

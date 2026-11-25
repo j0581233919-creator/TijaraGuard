@@ -52,11 +52,9 @@ class AnthropicProvider(AIProvider):
                 code=ProviderErrorCode.CONFIG_ERROR,
                 message=f"Missing API key ({self.config.api_key_env or 'ANTHROPIC_API_KEY'}).",
             )
-        hdrs = {
-            "x-api-key": self._api_key,
-            "anthropic-version": self.ANTHROPIC_VERSION,
-        }
-        hdrs.update(self.config.extra_headers)
+        hdrs = dict(self.config.extra_headers)
+        hdrs["x-api-key"] = self._api_key
+        hdrs["anthropic-version"] = self.ANTHROPIC_VERSION
         return hdrs
 
     def generate(self, request: AIRequest) -> AIResponse:

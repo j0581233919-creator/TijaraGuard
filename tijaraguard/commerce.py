@@ -43,6 +43,7 @@ def build_grounded_ai_callable(
     task_complexity: TaskComplexity = TaskComplexity.STANDARD,
     fallback_to_template: bool = True,
     on_metadata: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_attempt: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Callable[[str, Dict[str, Any]], str]:
     """Builds a CatalogCopilot custom_llm_callable backed by ModelRouter.
 
@@ -89,7 +90,7 @@ def build_grounded_ai_callable(
             metadata={"sku": item_dict.get("sku"), "language": lang},
         )
         try:
-            resp = ai_router.generate(req)
+            resp = ai_router.generate(req, on_attempt=on_attempt)
             if on_metadata is not None:
                 on_metadata(
                     {
@@ -168,6 +169,7 @@ class CommercialGate:
         ai_router: Optional[ModelRouter] = None,
         task_complexity: TaskComplexity = TaskComplexity.STANDARD,
         fallback_to_template_on_ai_error: bool = True,
+        on_ai_attempt: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> CommercialEvaluation:
         """Matches redacted inquiry to catalog and verifies the generated/LLM draft."""
         cleaned_query = strip_redaction_markers(envelope.redacted_text)
@@ -230,17 +232,18 @@ class CommercialGate:
                 task_complexity=task_complexity,
                 fallback_to_template=fallback_to_template_on_ai_error,
                 on_metadata=lambda m: ai_meta_box.update(m),
+                on_attempt=on_ai_attempt,
             )
 
         # Note: CatalogCopilot's DraftGenerator swallows exceptions from custom_llm_callable;
-        # when fallback_to_template_on_ai_error is False we want explicit ProviderExecutionError propagation.
+        # when fallback_to_template_on_ai_error is False we propagate any callable exception explicitly.
         captured_fatal_error: list[BaseException] = []
 
         def _guarded_callable(base_body: str, ctx: Dict[str, Any]) -> str:
             assert active_llm_callable is not None
             try:
                 return active_llm_callable(base_body, ctx)
-            except (ProviderExecutionError, PrivacyViolationError) as exc:
+            except BaseException as exc:
                 if not fallback_to_template_on_ai_error or isinstance(exc, PrivacyViolationError):
                     captured_fatal_error.append(exc)
                 raise

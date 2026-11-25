@@ -6,13 +6,14 @@ import csv
 import io
 import json
 import logging
+import secrets
 import socket
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from .config import TijaraGuardConfig
@@ -30,6 +31,7 @@ from .models import (
     ProviderError,
     VerificationBlockedError,
     canonical_json,
+    parse_bool_strict,
 )
 from .pipeline import TijaraGuardPipeline
 from .runtime import build_pipeline_from_config
@@ -44,12 +46,48 @@ from .security import (
 logger = logging.getLogger("tijaraguard.api")
 
 _MAX_REQUEST_BODY_BYTES = 1_048_576  # 1 MiB
-_DASHBOARD_HTML_PATH = Path(__file__).resolve().parent / "web" / "index.html"
+_WEB_DIR = Path(__file__).resolve().parent / "web"
+_DASHBOARD_HTML_PATH = _WEB_DIR / "index.html"
+_DASHBOARD_JS_PATH = _WEB_DIR / "app.js"
 
 
 def _query_map(raw_query: str) -> Dict[str, str]:
     parsed = parse_qs(raw_query, keep_blank_values=True)
     return {k: v[0] for k, v in parsed.items() if v}
+
+
+def _parse_int_strict(
+    value: Any,
+    field_name: str,
+    *,
+    default: Optional[int] = None,
+    min_val: int = 1,
+    max_val: int = 86400,
+) -> int:
+    if value is None:
+        if default is not None:
+            return default
+        raise MalformedInputError(f"Field '{field_name}' must be an integer.")
+    if isinstance(value, str) and not value.strip():
+        raise MalformedInputError(f"Field '{field_name}' must not be blank.")
+    if isinstance(value, bool):
+        raise MalformedInputError(f"Field '{field_name}' must be an integer, not boolean.")
+    if isinstance(value, int):
+        num = value
+    elif isinstance(value, str):
+        s = value.strip()
+        try:
+            num = int(s)
+        except ValueError as exc:
+            raise MalformedInputError(f"Field '{field_name}' must be a valid integer.") from exc
+    else:
+        raise MalformedInputError(f"Field '{field_name}' must be an integer.")
+
+    if num < min_val or num > max_val:
+        raise MalformedInputError(
+            f"Field '{field_name}' must be between {min_val} and {max_val}."
+        )
+    return num
 
 
 def _safe_draft_view(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -92,6 +130,7 @@ class TijaraGuardHTTPServer:
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._dashboard_bytes = _DASHBOARD_HTML_PATH.read_bytes()
+        self._dashboard_js_bytes = _DASHBOARD_JS_PATH.read_bytes()
 
     @property
     def base_url(self) -> str:
@@ -116,7 +155,6 @@ class TijaraGuardHTTPServer:
                 self.connection.settimeout(15.0)
 
             def log_message(self, format: str, *args: Any) -> None:
-                # Privacy-safe structured logging only; never dump raw request lines/queries.
                 return
 
             def _send_bytes(
@@ -139,7 +177,7 @@ class TijaraGuardHTTPServer:
                     self.send_header("Cache-Control", "no-store")
                     self.send_header(
                         "Content-Security-Policy",
-                        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
+                        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
                     )
                     if extra_headers:
                         for hk, hv in extra_headers.items():
@@ -164,12 +202,12 @@ class TijaraGuardHTTPServer:
                     extra_headers=extra_headers,
                 )
 
-            def _read_body(self) -> Tuple[bytes, Dict[str, Any]]:
+            def _read_raw_body(self) -> bytes:
                 if self.headers.get_all("Transfer-Encoding"):
                     raise MalformedInputError("Transfer-Encoding is not supported.")
                 cl_headers = self.headers.get_all("Content-Length") or []
                 if len(cl_headers) == 0:
-                    return b"", {}
+                    return b""
                 if len(cl_headers) != 1:
                     raise MalformedInputError("Multiple Content-Length headers rejected.")
                 raw_len = cl_headers[0].strip()
@@ -177,19 +215,24 @@ class TijaraGuardHTTPServer:
                     raise MalformedInputError("Invalid Content-Length header.")
                 length = int(raw_len)
                 if length == 0:
-                    return b"", {}
+                    return b""
                 if length > _MAX_REQUEST_BODY_BYTES:
                     raise MalformedInputError("Request payload exceeds 1 MiB limit.")
                 raw_bytes = self.rfile.read(length)
                 if len(raw_bytes) != length:
                     raise MalformedInputError("Incomplete request body.")
+                return raw_bytes
+
+            def _parse_json_object(self, raw_bytes: bytes) -> Dict[str, Any]:
+                if not raw_bytes:
+                    return {}
                 try:
                     data = json.loads(raw_bytes.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
                     raise MalformedInputError("Malformed JSON payload.") from exc
                 if not isinstance(data, dict):
                     raise MalformedInputError("JSON payload must be an object.")
-                return raw_bytes, data
+                return data
 
             def _check_rate_limit(self) -> bool:
                 client_ip = self.client_address[0] if self.client_address else "unknown"
@@ -239,10 +282,16 @@ class TijaraGuardHTTPServer:
                 parsed = urlsplit(self.path)
                 path = parsed.path
                 q = _query_map(parsed.query)
+                tenant_id = app.pipeline.tenant_id
 
                 try:
                     if path == "/":
                         self._send_bytes(200, "text/html; charset=utf-8", app._dashboard_bytes)
+                        return
+                    if path == "/app.js":
+                        self._send_bytes(
+                            200, "application/javascript; charset=utf-8", app._dashboard_js_bytes
+                        )
                         return
                     if path == "/health":
                         self._send_json(
@@ -255,19 +304,12 @@ class TijaraGuardHTTPServer:
                         )
                         return
                     if path == "/ready":
-                        chain_ok, chain_errs = app.pipeline.ledger.verify_audit_chain()
-                        code = 200 if chain_ok else 503
-                        self._send_json(
-                            code,
-                            {
-                                "ready": chain_ok,
-                                "audit_chain_valid": chain_ok,
-                                "audit_errors": len(chain_errs),
-                            },
-                        )
+                        # Lightweight connectivity check (full chain verification is behind /api/v1/status)
+                        with app.pipeline.ledger._connect(write=False) as conn:
+                            conn.execute("SELECT 1 FROM drafts LIMIT 1").fetchall()
+                        self._send_json(200, {"ready": True})
                         return
 
-                    # Meta WhatsApp webhook GET verification challenge
                     if path == "/webhooks/whatsapp":
                         if not app.pipeline.channel_registry.has("whatsapp"):
                             self._send_json(404, {"error": "whatsapp_not_enabled"})
@@ -289,11 +331,11 @@ class TijaraGuardHTTPServer:
                             200,
                             {
                                 "mode": app.pipeline.mode.value,
-                                "tenant_id": app.pipeline.tenant_id,
+                                "tenant_id": tenant_id,
                                 "audit_chain_valid": chain_ok,
                                 "audit_chain_errors": chain_errs,
                                 "state_counts": app.pipeline.ledger.get_state_counts(
-                                    tenant_id=app.pipeline.tenant_id
+                                    tenant_id=tenant_id
                                 ),
                                 "providers": (
                                     app.pipeline.ai_router.public_summary()
@@ -339,19 +381,25 @@ class TijaraGuardHTTPServer:
                         return
 
                     if path == "/api/v1/conversations":
+                        limit_val = _parse_int_strict(
+                            q.get("limit"), "limit", default=100, min_val=1, max_val=500
+                        )
                         convs = app.pipeline.ledger.list_conversations(
-                            tenant_id=q.get("tenant_id") or app.pipeline.tenant_id,
-                            limit=int(q.get("limit", "100")),
+                            tenant_id=tenant_id,
+                            limit=limit_val,
                         )
                         self._send_json(200, {"conversations": convs})
                         return
 
                     if path == "/api/v1/drafts":
+                        limit_val = _parse_int_strict(
+                            q.get("limit"), "limit", default=100, min_val=1, max_val=500
+                        )
                         drafts = app.pipeline.ledger.list_drafts(
-                            tenant_id=q.get("tenant_id") or app.pipeline.tenant_id,
+                            tenant_id=tenant_id,
                             state=q.get("state") or None,
                             conversation_id=q.get("conversation_id") or None,
-                            limit=int(q.get("limit", "100")),
+                            limit=limit_val,
                         )
                         self._send_json(200, {"drafts": [_safe_draft_view(d) for d in drafts]})
                         return
@@ -361,8 +409,10 @@ class TijaraGuardHTTPServer:
                         if "/" in draft_id or not draft_id:
                             self._send_json(404, {"error": "not_found"})
                             return
-                        draft = app.pipeline.ledger.get_draft(draft_id)
-                        events = app.pipeline.ledger.list_audit_events(draft_id=draft_id)
+                        draft = app.pipeline.ledger.get_draft(draft_id, tenant_id=tenant_id)
+                        events = app.pipeline.ledger.list_audit_events(
+                            draft_id=draft_id, tenant_id=tenant_id
+                        )
                         active_app = app.pipeline.ledger.get_active_approval(draft_id)
                         self._send_json(
                             200,
@@ -382,7 +432,9 @@ class TijaraGuardHTTPServer:
 
                     if path == "/api/v1/audit":
                         draft_id = q.get("draft_id") or None
-                        events = app.pipeline.ledger.list_audit_events(draft_id=draft_id)
+                        events = app.pipeline.ledger.list_audit_events(
+                            draft_id=draft_id, tenant_id=tenant_id
+                        )
                         valid, errors = app.pipeline.ledger.verify_audit_chain()
                         self._send_json(
                             200,
@@ -392,7 +444,7 @@ class TijaraGuardHTTPServer:
 
                     if path == "/api/v1/audit/export.csv":
                         events = app.pipeline.ledger.list_audit_events(
-                            draft_id=q.get("draft_id") or None
+                            draft_id=q.get("draft_id") or None, tenant_id=tenant_id
                         )
                         buf = io.StringIO()
                         writer = csv.writer(buf)
@@ -449,9 +501,7 @@ class TijaraGuardHTTPServer:
                     if path == "/api/v1/usage":
                         self._send_json(
                             200,
-                            app.pipeline.ledger.get_provider_usage_summary(
-                                tenant_id=q.get("tenant_id") or app.pipeline.tenant_id
-                            ),
+                            app.pipeline.ledger.get_provider_usage_summary(tenant_id=tenant_id),
                         )
                         return
 
@@ -465,11 +515,10 @@ class TijaraGuardHTTPServer:
                 parsed = urlsplit(self.path)
                 path = parsed.path
                 q = _query_map(parsed.query)
+                tenant_id = app.pipeline.tenant_id
 
                 try:
-                    raw_body, data = self._read_body()
-
-                    # Channel Webhooks (authenticated by channel-specific cryptographic checks)
+                    # 1. Webhooks: verify route + signature BEFORE JSON parsing
                     if path.startswith("/webhooks/"):
                         channel_name = path[len("/webhooks/"):].strip("/").lower()
                         if channel_name == "generic":
@@ -477,10 +526,12 @@ class TijaraGuardHTTPServer:
                         if not app.pipeline.channel_registry.has(channel_name):
                             self._send_json(404, {"error": f"channel_{channel_name}_not_enabled"})
                             return
+                        raw_body = self._read_raw_body()
                         adapter = app.pipeline.channel_registry.get(channel_name)
                         adapter.verify_inbound_request(self.headers, raw_body, q)
+                        data = self._parse_json_object(raw_body)
                         inbound_events, status_events = adapter.parse_inbound(
-                            data, tenant_id=app.pipeline.tenant_id
+                            data, tenant_id=tenant_id
                         )
                         ingested = [
                             app.pipeline.ingest_channel_event(ev) for ev in inbound_events
@@ -494,8 +545,6 @@ class TijaraGuardHTTPServer:
                                 "ok": True,
                                 "ingested_count": len(ingested),
                                 "status_count": len(statuses),
-                                "ingested": ingested,
-                                "statuses": statuses,
                             },
                         )
                         return
@@ -503,24 +552,45 @@ class TijaraGuardHTTPServer:
                     if not path.startswith("/api/v1/"):
                         self._send_json(404, {"error": "not_found"})
                         return
+
+                    # 2. Authenticate API request BEFORE reading/parsing JSON body
                     if not self._require_auth():
                         return
 
+                    raw_body = self._read_raw_body()
+                    data = self._parse_json_object(raw_body)
+
                     if path == "/api/v1/inquiries":
+                        rand_suffix = secrets.token_hex(4)
+                        msg_id = str(data.get("message_id") or f"msg-{int(time.time()*1000)}-{rand_suffix}")
+                        conv_id = str(data.get("conversation_id") or f"conv-{int(time.time()*1000)}-{rand_suffix}")
+                        raw_target = str(data.get("raw_contact_target") or "api-client")
                         msg = InboundMessage(
-                            message_id=str(data.get("message_id") or f"msg-{int(time.time()*1000)}"),
-                            conversation_id=str(data.get("conversation_id") or f"conv-{int(time.time()*1000)}"),
+                            message_id=msg_id,
+                            conversation_id=conv_id,
                             customer_handle=str(data.get("customer_handle") or "customer"),
-                            raw_contact_target=str(data.get("raw_contact_target") or "api-client"),
+                            raw_contact_target=raw_target,
                             contact_channel=str(data.get("contact_channel") or "chat"),
                             consent_to_contact=data.get("consent_to_contact", False),
                             consent_evidence=str(data.get("consent_evidence") or ""),
                             preferred_language=str(data.get("preferred_language") or "ar"),
                             raw_text=str(data.get("raw_text") or ""),
                             requested_sku=data.get("requested_sku"),
-                            tenant_id=str(data.get("tenant_id") or app.pipeline.tenant_id),
+                            tenant_id=tenant_id,
                         )
                         res = app.pipeline.process_inbound(msg)
+                        if (
+                            app.pipeline.route_store is not None
+                            and res["contact_channel"] in ("whatsapp", "telegram", "chatwoot", "webhook")
+                            and raw_target.strip()
+                        ):
+                            app.pipeline.route_store.put(
+                                tenant_id=tenant_id,
+                                channel=res["contact_channel"],
+                                contact_ref=res["contact_ref"],
+                                external_target=raw_target.strip(),
+                                external_conversation_id=res["conversation_id"],
+                            )
                         self._send_json(201, res)
                         return
 
@@ -535,7 +605,7 @@ class TijaraGuardHTTPServer:
 
                     if path == "/api/v1/maintenance/backup":
                         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                        dest = app.config.backup_dir / f"ledger-{stamp}.sqlite3"
+                        dest = app.config.backup_dir / f"ledger-{stamp}-{secrets.token_hex(4)}.sqlite3"
                         info = app.pipeline.ledger.backup_to(dest)
                         self._send_json(200, info)
                         return
@@ -556,14 +626,23 @@ class TijaraGuardHTTPServer:
                             self._send_json(404, {"error": "not_found"})
                             return
                         draft_id, action = parts
+                        # Enforce tenant scope on draft existence before action
+                        app.pipeline.ledger.get_draft(draft_id, tenant_id=tenant_id)
 
                         if action == "approve":
+                            ttl = _parse_int_strict(
+                                data.get("ttl_seconds"),
+                                "ttl_seconds",
+                                default=900,
+                                min_val=1,
+                                max_val=86400,
+                            )
                             token = app.pipeline.approve(
                                 draft_id,
                                 reviewer_id=str(data.get("reviewer_id") or "operator"),
                                 expected_payload_sha256=str(data.get("expected_payload_sha256") or ""),
                                 notes=str(data.get("notes") or ""),
-                                ttl_seconds=int(data.get("ttl_seconds") or 900),
+                                ttl_seconds=ttl,
                             )
                             self._send_json(
                                 200,
@@ -607,26 +686,41 @@ class TijaraGuardHTTPServer:
                             return
 
                         if action == "dispatch":
+                            lease_id = data.get("lease_id")
+                            approval_mac = data.get("approval_mac")
+                            payload_sha = data.get("payload_sha256")
+                            if (
+                                not isinstance(lease_id, str)
+                                or not lease_id.strip()
+                                or not isinstance(approval_mac, str)
+                                or not approval_mac.strip()
+                                or not isinstance(payload_sha, str)
+                                or not payload_sha.strip()
+                            ):
+                                raise ApprovalRequiredError(
+                                    "Explicit lease_id, approval_mac, and payload_sha256 are required for dispatch."
+                                )
                             active = app.pipeline.ledger.get_active_approval(draft_id)
                             if active is None:
                                 raise ApprovalRequiredError(
                                     f"No active approval lease found for '{draft_id}'."
                                 )
                             token = ApprovalToken(
-                                lease_id=str(data.get("lease_id") or active["lease_id"]),
+                                lease_id=lease_id.strip(),
                                 draft_id=draft_id,
-                                payload_sha256=str(
-                                    data.get("payload_sha256") or active["payload_sha256"]
-                                ),
+                                payload_sha256=payload_sha.strip(),
                                 reviewer_id=active["reviewer_id"],
                                 approved_at=float(active["approved_at"]),
                                 expires_at=float(active["expires_at"]),
-                                approval_mac=str(data.get("approval_mac") or active["approval_mac"]),
+                                approval_mac=approval_mac.strip(),
+                            )
+                            confirm_deliv = parse_bool_strict(
+                                data.get("confirm_delivered", True), "confirm_delivered"
                             )
                             outcome = app.pipeline.dispatch(
                                 draft_id,
                                 token,
-                                confirm_delivered=bool(data.get("confirm_delivered", True)),
+                                confirm_delivered=confirm_deliv,
                                 recipient_target=data.get("recipient_target"),
                             )
                             self._send_json(
@@ -645,9 +739,12 @@ class TijaraGuardHTTPServer:
                             return
 
                         if action == "recover":
+                            confirm_deliv = parse_bool_strict(
+                                data.get("confirm_delivered", True), "confirm_delivered"
+                            )
                             outcome = app.pipeline.recover_delivery(
                                 draft_id,
-                                confirm_delivered=bool(data.get("confirm_delivered", True)),
+                                confirm_delivered=confirm_deliv,
                             )
                             self._send_json(
                                 200,

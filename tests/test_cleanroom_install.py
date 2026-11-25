@@ -92,3 +92,46 @@ class TestCleanRoomInstall(unittest.TestCase):
         self.assertEqual(sec["live_ledger_pii_leaks"], 0)
         self.assertEqual(sec["receiver_and_outbox_pii_leaks"], 0)
         self.assertEqual(sec["application_log_pii_leaks"], 0)
+
+    def test_installed_wheel_style_layout_without_examples_uses_bundled_catalog(self) -> None:
+        # Simulate site-packages installation where neither examples/ nor pyproject.toml exists next to tijaraguard/
+        site_dir = self.tmpdir / "fake_site_packages"
+        site_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            REPO_ROOT / "tijaraguard",
+            site_dir / "tijaraguard",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        work_cwd = self.tmpdir / "user_workdir"
+        work_cwd.mkdir(parents=True, exist_ok=True)
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("TIJARAGUARD_")
+        }
+        clean_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        clean_env["PYTHONPATH"] = str(site_dir)
+        clean_env["TIJARAGUARD_STATE_DIR"] = str(work_cwd / "state")
+
+        p_chk = subprocess.run(
+            [sys.executable, "-B", "-m", "tijaraguard", "check-config"],
+            cwd=str(work_cwd),
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        chk = json.loads(p_chk.stdout)
+        self.assertTrue(chk["valid"], chk["errors"])
+        self.assertTrue(chk["summary"]["catalog_path"].endswith("catalog.json"))
+
+        p_demo = subprocess.run(
+            [sys.executable, "-B", "-m", "tijaraguard", "demo"],
+            cwd=str(work_cwd),
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertTrue(json.loads(p_demo.stdout)["security_and_audit_proof"]["live_audit_chain_valid"])

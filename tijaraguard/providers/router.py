@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from ..config import ProviderEndpointConfig, RoutingConfig, TijaraGuardConfig
@@ -52,11 +53,13 @@ class ModelRouter:
         routing: RoutingConfig,
         privacy_gate: Optional[PrivacyGate] = None,
         on_attempt: Optional[Callable[[Dict[str, Any]], None]] = None,
+        require_privacy_gate: bool = False,
     ) -> None:
         self.providers = dict(providers)
         self.routing = routing
         self.privacy_gate = privacy_gate
         self.on_attempt = on_attempt
+        self.require_privacy_gate = bool(require_privacy_gate)
 
     @classmethod
     def from_config(
@@ -65,6 +68,7 @@ class ModelRouter:
         *,
         privacy_gate: Optional[PrivacyGate] = None,
         on_attempt: Optional[Callable[[Dict[str, Any]], None]] = None,
+        require_privacy_gate: bool = False,
     ) -> "ModelRouter":
         instances: Dict[str, AIProvider] = {}
         for name, p_cfg in cfg.providers.items():
@@ -79,6 +83,7 @@ class ModelRouter:
             routing=cfg.routing,
             privacy_gate=privacy_gate,
             on_attempt=on_attempt,
+            require_privacy_gate=require_privacy_gate,
         )
 
     def _select_candidate_names(self, complexity: TaskComplexity) -> List[str]:
@@ -103,6 +108,10 @@ class ModelRouter:
 
     def _enforce_pre_send_pii_guard(self, request: AIRequest) -> None:
         if self.privacy_gate is None:
+            if self.require_privacy_gate:
+                raise PrivacyViolationError(
+                    "ModelRouter requires a configured PrivacyGate before sending outbound prompts."
+                )
             return
         leaked_sys = self.privacy_gate.verify_text_clean(request.system_prompt)
         leaked_usr = self.privacy_gate.verify_text_clean(request.user_prompt)
@@ -112,14 +121,24 @@ class ModelRouter:
                 f"Blocked outbound AI request containing unredacted PII categories: {leaked}"
             )
 
-    def _emit_attempt(self, record: Dict[str, Any]) -> None:
-        if self.on_attempt is not None:
-            try:
-                self.on_attempt(record)
-            except Exception:
-                pass
+    def _emit_attempt(
+        self,
+        record: Dict[str, Any],
+        per_call_cb: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> None:
+        for cb in (per_call_cb, self.on_attempt):
+            if cb is not None:
+                try:
+                    cb(record)
+                except Exception:
+                    pass
 
-    def generate(self, request: AIRequest) -> AIResponse:
+    def generate(
+        self,
+        request: AIRequest,
+        *,
+        on_attempt: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> AIResponse:
         """Executes AI generation with Gate 1 PII check and observable fallback policy."""
         self._enforce_pre_send_pii_guard(request)
 
@@ -139,6 +158,22 @@ class ModelRouter:
                     retryable=False,
                 )
                 last_error = err
+                self._emit_attempt(
+                    {
+                        "provider": name,
+                        "model": "unknown",
+                        "task_tier": request.task_complexity.value,
+                        "status": "ERROR",
+                        "error_category": err.code.value,
+                        "latency_ms": 0.0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "estimated_cost_usd": 0.0,
+                        "fallback_from": primary_name if idx > 0 else None,
+                    },
+                    on_attempt,
+                )
                 if idx < len(candidates) - 1 and self.routing.allow_fallback:
                     fallback_events.append(
                         {"from": name, "error_code": err.code.value, "reason": str(err)}
@@ -146,6 +181,7 @@ class ModelRouter:
                     continue
                 raise err
 
+            t0 = time.monotonic()
             try:
                 response = provider.generate(request)
                 self._emit_attempt(
@@ -161,7 +197,8 @@ class ModelRouter:
                         "total_tokens": response.usage.total_tokens,
                         "estimated_cost_usd": response.usage.estimated_cost_usd,
                         "fallback_from": primary_name if idx > 0 else None,
-                    }
+                    },
+                    on_attempt,
                 )
                 if fallback_events:
                     logger.info(
@@ -181,6 +218,7 @@ class ModelRouter:
                     raw_request_id=response.raw_request_id,
                 )
             except ProviderExecutionError as exc:
+                elapsed_ms = max(0.01, (time.monotonic() - t0) * 1000.0)
                 last_error = exc
                 self._emit_attempt(
                     {
@@ -189,13 +227,14 @@ class ModelRouter:
                         "task_tier": request.task_complexity.value,
                         "status": "ERROR",
                         "error_category": exc.code.value,
-                        "latency_ms": 0.0,
+                        "latency_ms": round(elapsed_ms, 2),
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "total_tokens": 0,
                         "estimated_cost_usd": 0.0,
                         "fallback_from": primary_name if idx > 0 else None,
-                    }
+                    },
+                    on_attempt,
                 )
                 logger.warning(
                     "provider_error provider=%s model=%s code=%s retryable=%s",

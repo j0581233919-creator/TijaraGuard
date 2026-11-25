@@ -50,8 +50,8 @@ class OpenAICompatibleProvider(AIProvider):
                 code=ProviderErrorCode.CONFIG_ERROR,
                 message=f"Missing API key ({self.config.api_key_env or 'api_key'}).",
             )
-        hdrs = {"Authorization": f"Bearer {self._api_key}"}
-        hdrs.update(self.config.extra_headers)
+        hdrs = dict(self.config.extra_headers)
+        hdrs["Authorization"] = f"Bearer {self._api_key}"
         return hdrs
 
     def generate(self, request: AIRequest) -> AIResponse:

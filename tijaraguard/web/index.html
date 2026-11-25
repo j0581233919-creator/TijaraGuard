@@ -68,27 +68,35 @@
     }
     .row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     .muted { color: var(--muted); font-size: 0.82rem; }
+    #noticeBanner {
+      margin: 12px 20px 0 20px; padding: 10px 14px; border-radius: 8px;
+      display: none; font-size: 0.9rem; border: 1px solid var(--border);
+    }
+    #noticeBanner.err { display: block; background: #450a0a; color: #fecaca; border-color: #dc2626; }
+    #noticeBanner.ok { display: block; background: #052e16; color: #bbf7d0; border-color: #22c55e; }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">TijaraGuard Operator Console</div>
     <div class="controls">
-      <input id="apiKeyInput" type="password" placeholder="Operator API Key (TIJARAGUARD_API_KEY)" size="28" />
+      <input id="apiKeyInput" type="password" placeholder="Operator API Key (TIJARAGUARD_API_KEY)" size="28" autocomplete="off" />
       <input id="reviewerInput" type="text" value="supervisor_operator" placeholder="Reviewer ID" size="18" />
-      <button onclick="saveAuthAndRefresh()">Connect / Refresh</button>
-      <button class="secondary" onclick="toggleDir()">RTL / LTR</button>
+      <button id="connectBtn" type="button">Connect / Refresh</button>
+      <button id="dirBtn" class="secondary" type="button">RTL / LTR</button>
     </div>
   </header>
+
+  <div id="noticeBanner" role="status"></div>
 
   <main>
     <section class="card col-6">
       <h2>1. System Status &amp; Audit Integrity</h2>
-      <div id="statusStats" class="grid-stats"><span class="muted">Connect with Operator API key to load live state.</span></div>
+      <div id="statusStats" class="grid-stats"><span class="muted">Enter Operator API Key and click Connect / Refresh.</span></div>
       <div class="row-actions">
-        <button class="secondary" onclick="checkProvidersHealth()">Run Provider Health Checks</button>
-        <button class="secondary" onclick="runBackup()">Backup Ledger</button>
-        <button class="secondary" onclick="downloadAuditCsv()">Export Audit CSV</button>
+        <button id="healthBtn" class="secondary" type="button">Run Provider Health Checks</button>
+        <button id="backupBtn" class="secondary" type="button">Backup Ledger</button>
+        <button id="exportCsvBtn" class="secondary" type="button">Export Audit CSV</button>
       </div>
     </section>
 
@@ -101,7 +109,7 @@
       <h2>3. Catalog Lookup &amp; New Inquiry</h2>
       <div style="display:flex; gap:6px; margin-bottom:8px;">
         <input id="catalogQuery" type="text" placeholder="Search SKU / Arabic query..." style="flex:1;" />
-        <button onclick="searchCatalog()">Lookup</button>
+        <button id="catalogBtn" type="button">Lookup</button>
       </div>
       <div id="catalogResult" class="muted" style="margin-bottom:10px;"></div>
       <hr style="border-color:var(--border);" />
@@ -122,14 +130,14 @@
         <input id="inqEvidence" type="text" value="operator_console_opt_in" placeholder="Consent evidence" />
         <label><input id="inqConsent" type="checkbox" checked /> Consent to contact</label>
         <textarea id="inqText" rows="3" class="rtl" placeholder="اكتب استفسار العميل..."></textarea>
-        <button onclick="submitInquiry()">Process Through 4 Gates</button>
+        <button id="submitInqBtn" type="button">Process Through 4 Gates</button>
       </div>
     </section>
 
     <section class="card col-8">
       <h2>4. Drafts &amp; Human Approval Queue</h2>
       <div class="controls" style="margin-bottom:8px;">
-        <select id="stateFilter" onchange="loadDrafts()">
+        <select id="stateFilter">
           <option value="">All States</option>
           <option value="PENDING_APPROVAL">PENDING_APPROVAL</option>
           <option value="APPROVED">APPROVED</option>
@@ -141,7 +149,7 @@
           <option value="REJECTED">REJECTED</option>
           <option value="FAILED_DELIVERY">FAILED_DELIVERY</option>
         </select>
-        <button class="secondary" onclick="loadDrafts()">Reload Drafts</button>
+        <button id="reloadDraftsBtn" class="secondary" type="button">Reload Drafts</button>
       </div>
       <div style="overflow:auto; max-height:320px;">
         <table>
@@ -164,200 +172,6 @@
     </section>
   </main>
 
-  <script>
-    const keyInput = document.getElementById("apiKeyInput");
-    keyInput.value = sessionStorage.getItem("tg_api_key") || "";
-
-    function headers() {
-      const k = keyInput.value.trim();
-      const h = { "Content-Type": "application/json" };
-      if (k) h["Authorization"] = "Bearer " + k;
-      return h;
-    }
-
-    async function api(path, opts = {}) {
-      const res = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
-      const ct = res.headers.get("content-type") || "";
-      const body = ct.includes("application/json") ? await res.json() : await res.text();
-      if (!res.ok) throw new Error(typeof body === "string" ? body : JSON.stringify(body));
-      return body;
-    }
-
-    function toggleDir() {
-      document.documentElement.dir = document.documentElement.dir === "rtl" ? "ltr" : "rtl";
-    }
-
-    async function saveAuthAndRefresh() {
-      sessionStorage.setItem("tg_api_key", keyInput.value.trim());
-      await refreshAll();
-    }
-
-    async function refreshAll() {
-      try {
-        const [st, usage, drafts] = await Promise.all([
-          api("/api/v1/status"),
-          api("/api/v1/usage"),
-          api("/api/v1/drafts" + (document.getElementById("stateFilter").value ? "?state=" + encodeURIComponent(document.getElementById("stateFilter").value) : ""))
-        ]);
-        renderStatus(st, usage);
-        renderDrafts(drafts.drafts || []);
-      } catch (err) {
-        document.getElementById("statusStats").innerHTML = `<span style="color:var(--bad)">Error: ${escapeHtml(err.message)}</span>`;
-      }
-    }
-
-    function escapeHtml(s) {
-      return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
-    }
-
-    function renderStatus(st, usage) {
-      const sc = st.state_counts || {};
-      document.getElementById("statusStats").innerHTML = `
-        <div class="stat"><div class="label">Mode</div><div class="val">${escapeHtml(st.mode)}</div></div>
-        <div class="stat"><div class="label">Audit Chain</div><div class="val">${st.audit_chain_valid ? "VALID" : "INVALID"}</div></div>
-        <div class="stat"><div class="label">Pending</div><div class="val">${sc.PENDING_APPROVAL || 0}</div></div>
-        <div class="stat"><div class="label">Approved</div><div class="val">${sc.APPROVED || 0}</div></div>
-        <div class="stat"><div class="label">Delivered</div><div class="val">${sc.DELIVERED || 0}</div></div>
-        <div class="stat"><div class="label">Unknown</div><div class="val">${sc.UNKNOWN_DELIVERY || 0}</div></div>
-      `;
-      document.getElementById("infraPanel").innerHTML = `
-        <div><strong>Providers:</strong> ${escapeHtml(JSON.stringify((st.providers || {}).providers || []))}</div>
-        <div><strong>Routing:</strong> ${escapeHtml(JSON.stringify((st.providers || {}).routing || {}))}</div>
-        <div><strong>Usage:</strong> calls=${usage.total_calls || 0}, tokens=${usage.total_tokens || 0}, est_usd=${usage.estimated_cost_usd || 0}</div>
-        <div><strong>Channels:</strong> ${escapeHtml(JSON.stringify(st.channels || {}))}</div>
-      `;
-    }
-
-    function renderDrafts(list) {
-      const tb = document.getElementById("draftsBody");
-      tb.innerHTML = list.map(d => `
-        <tr>
-          <td><code>${escapeHtml(d.draft_id)}</code></td>
-          <td>${escapeHtml(d.contact_channel)}</td>
-          <td>${escapeHtml(d.sku || "-")}</td>
-          <td>${escapeHtml(d.ai_provider || "-")}</td>
-          <td><span class="badge b-${escapeHtml(d.state)}">${escapeHtml(d.state)}</span></td>
-          <td><button class="secondary" onclick="inspectDraft('${escapeHtml(d.draft_id)}')">Inspect</button></td>
-        </tr>
-      `).join("");
-    }
-
-    async function loadDrafts() {
-      const f = document.getElementById("stateFilter").value;
-      const res = await api("/api/v1/drafts" + (f ? "?state=" + encodeURIComponent(f) : ""));
-      renderDrafts(res.drafts || []);
-    }
-
-    async function inspectDraft(draftId) {
-      const data = await api("/api/v1/drafts/" + encodeURIComponent(draftId));
-      const d = data.draft;
-      document.getElementById("auditOutput").textContent = JSON.stringify(data.audit_events || [], null, 2);
-      document.getElementById("draftInspector").innerHTML = `
-        <div><strong>${escapeHtml(d.draft_id)}</strong> | <span class="badge b-${escapeHtml(d.state)}">${escapeHtml(d.state)}</span> | Verification: <strong>${escapeHtml(d.verification_status)}</strong></div>
-        <div class="muted">Channel: ${escapeHtml(d.contact_channel)} | ContactRef: ${escapeHtml(d.contact_ref)} | SHA256: <code>${escapeHtml(d.payload_sha256)}</code></div>
-        <p><strong>Redacted Inquiry:</strong></p>
-        <pre class="rtl">${escapeHtml(d.redacted_inquiry)}</pre>
-        <p><strong>Draft Body (Editable):</strong></p>
-        <textarea id="editBodyBox" rows="5" style="width:100%;" class="rtl">${escapeHtml(d.body)}</textarea>
-        <div class="row-actions">
-          <button class="secondary" onclick="editDraft('${escapeHtml(d.draft_id)}')">Save &amp; Re-Verify</button>
-          <button class="ok" onclick="approveDraft('${escapeHtml(d.draft_id)}', '${escapeHtml(d.payload_sha256)}')">Approve</button>
-          <button onclick="dispatchDraft('${escapeHtml(d.draft_id)}')">Dispatch</button>
-          <button class="secondary" onclick="recoverDraft('${escapeHtml(d.draft_id)}')">Recover</button>
-          <button class="secondary" onclick="escalateDraft('${escapeHtml(d.draft_id)}')">Escalate</button>
-          <button class="danger" onclick="rejectDraft('${escapeHtml(d.draft_id)}')">Reject</button>
-        </div>
-      `;
-    }
-
-    async function searchCatalog() {
-      const q = document.getElementById("catalogQuery").value.trim();
-      const res = await api("/api/v1/catalog/search?q=" + encodeURIComponent(q));
-      document.getElementById("catalogResult").textContent = JSON.stringify(res);
-    }
-
-    async function submitInquiry() {
-      const payload = {
-        customer_handle: document.getElementById("inqCustomer").value,
-        raw_contact_target: document.getElementById("inqTarget").value,
-        contact_channel: document.getElementById("inqChannel").value,
-        preferred_language: document.getElementById("inqLang").value,
-        consent_evidence: document.getElementById("inqEvidence").value,
-        consent_to_contact: document.getElementById("inqConsent").checked,
-        raw_text: document.getElementById("inqText").value,
-      };
-      const res = await api("/api/v1/inquiries", { method: "POST", body: JSON.stringify(payload) });
-      await refreshAll();
-      await inspectDraft(res.draft_id);
-    }
-
-    async function editDraft(id) {
-      await api(`/api/v1/drafts/${encodeURIComponent(id)}/edit`, {
-        method: "POST",
-        body: JSON.stringify({ new_body: document.getElementById("editBodyBox").value, actor: document.getElementById("reviewerInput").value })
-      });
-      await refreshAll();
-      await inspectDraft(id);
-    }
-
-    async function approveDraft(id, sha) {
-      await api(`/api/v1/drafts/${encodeURIComponent(id)}/approve`, {
-        method: "POST",
-        body: JSON.stringify({ reviewer_id: document.getElementById("reviewerInput").value, expected_payload_sha256: sha })
-      });
-      await refreshAll();
-      await inspectDraft(id);
-    }
-
-    async function dispatchDraft(id) {
-      await api(`/api/v1/drafts/${encodeURIComponent(id)}/dispatch`, { method: "POST", body: "{}" });
-      await refreshAll();
-      await inspectDraft(id);
-    }
-
-    async function recoverDraft(id) {
-      await api(`/api/v1/drafts/${encodeURIComponent(id)}/recover`, { method: "POST", body: "{}" });
-      await refreshAll();
-      await inspectDraft(id);
-    }
-
-    async function escalateDraft(id) {
-      await api(`/api/v1/drafts/${encodeURIComponent(id)}/escalate`, {
-        method: "POST",
-        body: JSON.stringify({ actor: document.getElementById("reviewerInput").value, reason: "operator_escalated" })
-      });
-      await refreshAll();
-      await inspectDraft(id);
-    }
-
-    async function rejectDraft(id) {
-      await api(`/api/v1/drafts/${encodeURIComponent(id)}/reject`, {
-        method: "POST",
-        body: JSON.stringify({ reviewer_id: document.getElementById("reviewerInput").value, reason: "operator_rejected" })
-      });
-      await refreshAll();
-      await inspectDraft(id);
-    }
-
-    async function checkProvidersHealth() {
-      const res = await api("/api/v1/providers/health", { method: "POST", body: "{}" });
-      alert(JSON.stringify(res.results, null, 2));
-    }
-
-    async function runBackup() {
-      const res = await api("/api/v1/maintenance/backup", { method: "POST", body: "{}" });
-      alert("Backup created: " + res.backup_path + "\nSHA256: " + res.sha256);
-    }
-
-    async function downloadAuditCsv() {
-      const res = await fetch("/api/v1/audit/export.csv", { headers: headers() });
-      const text = await res.text();
-      const blob = new Blob([text], { type: "text/csv" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "tijaraguard_audit.csv";
-      a.click();
-    }
-  </script>
+  <script src="/app.js"></script>
 </body>
 </html>

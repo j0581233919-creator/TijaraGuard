@@ -7,9 +7,7 @@ import http.client
 import json
 import socket
 import ssl
-import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
 from ..config import TelegramConfig
 from ..models import ChannelError
@@ -17,6 +15,7 @@ from ..security import (
     ReplayError,
     SSRFError,
     WebhookSignatureError,
+    open_validated_connection,
     scrub_secrets_from_text,
     validate_outbound_url,
     verify_timestamp_window,
@@ -62,10 +61,10 @@ class TelegramBotAdapter(ChannelAdapter):
                 base,
                 allow_loopback=self.allow_loopback,
                 allow_http_loopback=self.allow_loopback,
+                require_dns=False,
             )
         except SSRFError as exc:
             raise ChannelError(f"Invalid Telegram base_url: {exc}") from exc
-        # Never embed bot_token inside public endpoint_url!
         self.endpoint_url = f"{self.base_url}/bot_api"
 
     def verify_inbound_request(
@@ -88,11 +87,11 @@ class TelegramBotAdapter(ChannelAdapter):
         payload: Dict[str, Any],
         *,
         tenant_id: str = "default",
+        enforce_replay_window: bool = True,
     ) -> Tuple[List[ChannelInboundEvent], List[ChannelStatusEvent]]:
         if not isinstance(payload, dict):
             raise ChannelError("Telegram update payload must be a JSON object.")
 
-        # Support either single Update or getUpdates {"ok": true, "result": [...]}
         if "result" in payload and isinstance(payload["result"], list):
             updates = payload["result"]
         else:
@@ -116,7 +115,9 @@ class TelegramBotAdapter(ChannelAdapter):
                 ts = float(msg.get("date", 0))
             except (TypeError, ValueError) as exc:
                 raise ReplayError("Invalid Telegram message.date timestamp.") from exc
-            if not verify_timestamp_window(ts, max_skew_seconds=self.replay_window_seconds):
+            if enforce_replay_window and not verify_timestamp_window(
+                ts, max_skew_seconds=self.replay_window_seconds
+            ):
                 raise ReplayError("Telegram update timestamp outside replay window.")
 
             sender = msg.get("from") or {}
@@ -128,7 +129,11 @@ class TelegramBotAdapter(ChannelAdapter):
                 or f"tg_{str(chat_id).lstrip('-')}"
             )
             chat_str = str(chat_id)
-            safe_conv = f"tg-{chat_str}" if chat_str.lstrip("-").isdigit() else normalize_receipt_id("tg", chat_str)
+            safe_conv = (
+                f"tg-{chat_str}"
+                if chat_str.lstrip("-").isdigit()
+                else normalize_receipt_id("tg", chat_str)
+            )
 
             events.append(
                 ChannelInboundEvent(
@@ -162,29 +167,25 @@ class TelegramBotAdapter(ChannelAdapter):
         if not token:
             raise ChannelError("Telegram bot_token is not configured.")
 
-        base = validate_outbound_url(
-            self.base_url,
-            allow_loopback=self.allow_loopback,
-            allow_http_loopback=self.allow_loopback,
-        )
-        parsed = urlsplit(base)
-        api_path = f"{parsed.path.rstrip('/')}/bot{token}/sendMessage"
-        payload = {
-            "chat_id": target,
-            "text": text,
-        }
+        try:
+            conn, base_path, host_header = open_validated_connection(
+                self.base_url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+            )
+        except SSRFError as exc:
+            raise ChannelError(f"Telegram endpoint blocked by SSRF policy: {exc}") from exc
+
+        api_path = f"{base_path.rstrip('/')}/bot{token}/sendMessage"
+        payload = {"chat_id": target, "text": text}
         raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
+            "Host": host_header,
             "Content-Type": "application/json",
             "Content-Length": str(len(raw_body)),
             "X-Idempotency-Key": idempotency_key,
             "Connection": "close",
         }
-        conn = (
-            http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-        )
         try:
             try:
                 conn.connect()
@@ -229,32 +230,38 @@ class TelegramBotAdapter(ChannelAdapter):
         finally:
             conn.close()
 
-    def fetch_updates(self, *, offset: Optional[int] = None, limit: int = 20) -> List[ChannelInboundEvent]:
+    def fetch_updates(
+        self,
+        *,
+        offset: Optional[int] = None,
+        limit: int = 20,
+        tenant_id: str = "default",
+        enforce_replay_window: bool = False,
+    ) -> List[ChannelInboundEvent]:
         """Polls Telegram getUpdates API (alternative to webhook mode)."""
         token = (self.config.bot_token or "").strip()
         if not token:
             raise ChannelError("Telegram bot_token is not configured.")
-        base = validate_outbound_url(
-            self.base_url,
-            allow_loopback=self.allow_loopback,
-            allow_http_loopback=self.allow_loopback,
-        )
-        parsed = urlsplit(base)
-        api_path = f"{parsed.path.rstrip('/')}/bot{token}/getUpdates"
+        try:
+            conn, base_path, host_header = open_validated_connection(
+                self.base_url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+            )
+        except SSRFError as exc:
+            raise ChannelError(f"Telegram endpoint blocked by SSRF policy: {exc}") from exc
+
+        api_path = f"{base_path.rstrip('/')}/bot{token}/getUpdates"
         params = {"limit": max(1, min(100, int(limit))), "timeout": 0}
         if offset is not None:
             params["offset"] = int(offset)
         raw_body = json.dumps(params).encode("utf-8")
         headers = {
+            "Host": host_header,
             "Content-Type": "application/json",
             "Content-Length": str(len(raw_body)),
             "Connection": "close",
         }
-        conn = (
-            http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-        )
         try:
             conn.request("POST", api_path, body=raw_body, headers=headers)
             resp = conn.getresponse()
@@ -266,7 +273,11 @@ class TelegramBotAdapter(ChannelAdapter):
                         f"Telegram getUpdates failed ({resp.status})", (token,)
                     )
                 )
-            events, _ = self.parse_inbound(data)
+            events, _ = self.parse_inbound(
+                data,
+                tenant_id=tenant_id,
+                enforce_replay_window=enforce_replay_window,
+            )
             return events
         except (OSError, http.client.HTTPException, ssl.SSLError, ValueError) as exc:
             raise ChannelError(

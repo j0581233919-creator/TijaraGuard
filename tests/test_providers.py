@@ -457,3 +457,60 @@ class TestProviders(unittest.TestCase):
         self.assertEqual(len(pipe.ledger.list_drafts()), drafts_before)
         chain_ok, _ = pipe.ledger.verify_audit_chain()
         self.assertTrue(chain_ok)
+
+        # Observable provider fallback (primary fails -> secondary succeeds) + usage linked to draft_id
+        self.srv.mode = "ok"
+        bad_primary = OpenAICompatibleProvider(
+            ProviderEndpointConfig(
+                name="bad_primary",
+                kind="openai_compat",
+                model="gpt-4o-mini",
+                base_url=f"{self.srv.base_url}/v1",
+                api_key="sk-bad",
+                max_retries=0,
+            ),
+            allow_loopback=True,
+        )
+        # Override bad_primary base_url to auth-failing endpoint via router missing/timeout or 401 mock
+        bad_primary_cfg = ProviderEndpointConfig(
+            name="missing_route_test",
+            kind="openai_compat",
+            model="gpt-4o-mini",
+            base_url=f"{self.srv.base_url}/v1",
+            api_key="",  # triggers CONFIG_ERROR
+            max_retries=0,
+        )
+        bad_primary_inst = OpenAICompatibleProvider(bad_primary_cfg, allow_loopback=True)
+        fb_router = ModelRouter(
+            providers={"bad_primary": bad_primary_inst, "anthropic": anth},
+            routing=RoutingConfig(
+                default_provider="bad_primary",
+                allow_fallback=True,
+                fallback_chain=("anthropic",),
+                fallback_to_template=True,
+            ),
+        )
+        pipe_fb = TijaraGuardPipeline(
+            catalog=load_test_catalog(),
+            ledger_db_path=self.tmpdir / "ledger_fb.sqlite3",
+            approval_secret=make_secret_bytes(),
+            contact_hash_key=make_secret_bytes(),
+            mode=ExecutionMode.SHADOW,
+            ai_router=fb_router,
+            fallback_to_template_on_ai_error=True,
+        )
+        res_fb = pipe_fb.process_inbound(
+            make_inbound_message(
+                message_id="msg-ai-fb-1",
+                raw_text="كم سعر سماعة سوني WH-1000XM5؟",
+                requested_sku="SONY-WH1000XM5",
+            )
+        )
+        self.assertEqual(res_fb["ai_provider"], "anthropic")
+        self.assertEqual(len(res_fb["ai_metadata"]["fallback_events"]), 1)
+        usage_fb = pipe_fb.ledger.get_provider_usage_summary()
+        self.assertEqual(usage_fb["total_calls"], 2)
+        with pipe_fb.ledger._connect(write=False) as conn:
+            urows = conn.execute("SELECT draft_id, status, latency_ms FROM provider_usage").fetchall()
+            self.assertTrue(all(r["draft_id"] == res_fb["draft_id"] for r in urows))
+            self.assertTrue(all(r["latency_ms"] > 0.0 for r in urows))

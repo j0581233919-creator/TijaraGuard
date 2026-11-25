@@ -1,4 +1,4 @@
-"""Hardened stdlib HTTP/HTTPS JSON client with SSRF validation, bounded retries, and no redirects."""
+"""Hardened stdlib HTTP/HTTPS JSON client with DNS-pinned SSRF validation, bounded retries, and no redirects."""
 
 from __future__ import annotations
 
@@ -8,16 +8,15 @@ import socket
 import ssl
 import time
 from typing import Any, Dict, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
-from ..security import SSRFError, scrub_secrets_from_text, validate_outbound_url
+from ..security import SSRFError, open_validated_connection, scrub_secrets_from_text
 from .base import ProviderErrorCode, ProviderExecutionError
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
 
 
 class HardenedJSONHttpClient:
-    """Executes JSON HTTP requests with strict SSRF checks, timeouts, and bounded retries."""
+    """Executes JSON HTTP requests with strict SSRF checks, DNS IP pinning, timeouts, and bounded retries."""
 
     def __init__(
         self,
@@ -47,26 +46,6 @@ class HardenedJSONHttpClient:
         body: Optional[Dict[str, Any]] = None,
         retry_on_errors: bool = True,
     ) -> Tuple[int, Dict[str, Any], float, Dict[str, str]]:
-        try:
-            clean_url = validate_outbound_url(
-                url,
-                allow_loopback=self.allow_loopback,
-                allow_http_loopback=self.allow_loopback,
-            )
-        except SSRFError as exc:
-            raise ProviderExecutionError(
-                provider=self.provider_name,
-                model=self.model_name,
-                code=ProviderErrorCode.CONFIG_ERROR,
-                message=str(exc),
-                retryable=False,
-            ) from exc
-
-        parsed = urlsplit(clean_url)
-        path = parsed.path or "/"
-        if parsed.query:
-            path = f"{path}?{parsed.query}"
-
         req_headers = {
             "Accept": "application/json",
             "Connection": "close",
@@ -89,10 +68,7 @@ class HardenedJSONHttpClient:
             try:
                 status, resp_headers, raw = self._single_request(
                     method=method.upper(),
-                    scheme=parsed.scheme,
-                    host=parsed.hostname or "",
-                    port=parsed.port,
-                    path=path,
+                    url=url,
                     headers=req_headers,
                     body_bytes=payload_bytes,
                 )
@@ -169,29 +145,30 @@ class HardenedJSONHttpClient:
         self,
         *,
         method: str,
-        scheme: str,
-        host: str,
-        port: Optional[int],
-        path: str,
+        url: str,
         headers: Mapping[str, str],
         body_bytes: Optional[bytes],
     ) -> Tuple[int, Dict[str, str], bytes]:
-        if scheme == "https":
-            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                host,
-                port=port,
-                timeout=self.timeout_seconds,
-                context=self._ssl_context,
-            )
-        else:
-            conn = http.client.HTTPConnection(
-                host,
-                port=port,
-                timeout=self.timeout_seconds,
-            )
-
         try:
-            conn.request(method, path, body=body_bytes, headers=dict(headers))
+            conn, path, host_header = open_validated_connection(
+                url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+                ssl_context=self._ssl_context,
+            )
+        except SSRFError as exc:
+            raise ProviderExecutionError(
+                provider=self.provider_name,
+                model=self.model_name,
+                code=ProviderErrorCode.CONFIG_ERROR,
+                message=str(exc),
+                retryable=False,
+            ) from exc
+
+        req_hdrs = dict(headers)
+        req_hdrs.setdefault("Host", host_header)
+        try:
+            conn.request(method, path, body=body_bytes, headers=req_hdrs)
             resp = conn.getresponse()
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
             if len(raw) > _MAX_RESPONSE_BYTES:

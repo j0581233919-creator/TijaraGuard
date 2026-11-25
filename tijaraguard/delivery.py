@@ -20,6 +20,7 @@ from .security import SSRFError, harden_state_permissions, validate_outbound_url
 
 _DEPS = load_dependencies()
 _ms = _DEPS.message_shield
+_OUTBOX_INIT_LOCK = threading.Lock()
 
 from message_shield.engine import Shield  # type: ignore[import-not-found]
 from message_shield.model import (  # type: ignore[import-not-found]
@@ -111,12 +112,26 @@ class MessageShieldDeliveryAdapter:
         self.source = source
         self.timeout = float(timeout)
         self._custom_transport = transport
-        self.shield = Shield(
-            self.outbox_db_path,
-            self.endpoint_url,
-            create=not self.outbox_db_path.exists(),
-            timeout=self.timeout,
-        )
+        with _OUTBOX_INIT_LOCK:
+            try:
+                self.shield = Shield(
+                    self.outbox_db_path,
+                    self.endpoint_url,
+                    create=not self.outbox_db_path.exists(),
+                    timeout=self.timeout,
+                )
+            except FileExistsError:
+                try:
+                    self.shield = Shield(
+                        self.outbox_db_path,
+                        self.endpoint_url,
+                        create=False,
+                        timeout=self.timeout,
+                    )
+                except ValueError as exc:
+                    raise DeliveryError(f"Invalid MessageShield configuration: {exc}") from exc
+            except ValueError as exc:
+                raise DeliveryError(f"Invalid MessageShield configuration: {exc}") from exc
         if transport is not None:
             self.shield.transport = transport
         harden_state_permissions(self.outbox_db_path, is_dir=False)

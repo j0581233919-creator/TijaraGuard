@@ -8,15 +8,15 @@ import socket
 import ssl
 import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
 from ..config import GenericWebhookConfig
-from ..models import ChannelError, parse_bool_strict
+from ..models import ChannelError, MalformedInputError, parse_bool_strict
 from ..security import (
     ReplayError,
     SSRFError,
     WebhookSignatureError,
     compute_hmac_sha256_hex,
+    open_validated_connection,
     scrub_secrets_from_text,
     validate_outbound_url,
     verify_hmac_sha256,
@@ -64,6 +64,7 @@ class GenericWebhookAdapter(ChannelAdapter):
                     config.outbound_url.strip(),
                     allow_loopback=self.allow_loopback,
                     allow_http_loopback=self.allow_loopback,
+                    require_dns=False,
                 )
             except SSRFError as exc:
                 raise ChannelError(f"Invalid webhook outbound_url: {exc}") from exc
@@ -74,6 +75,7 @@ class GenericWebhookAdapter(ChannelAdapter):
                     config.receipt_lookup_url.strip(),
                     allow_loopback=self.allow_loopback,
                     allow_http_loopback=self.allow_loopback,
+                    require_dns=False,
                 )
             except SSRFError as exc:
                 raise ChannelError(f"Invalid webhook receipt_lookup_url: {exc}") from exc
@@ -120,16 +122,36 @@ class GenericWebhookAdapter(ChannelAdapter):
         text = str(payload.get("text") or "").strip()
         target = str(payload.get("target") or payload.get("contact") or "").strip()
         if not event_id or not conv_id or not text or not target:
-            raise ChannelError(
+            raise MalformedInputError(
                 "Generic webhook payload requires event_id, conversation_id, target, and text."
             )
-        ts = float(payload.get("timestamp") or time.time())
+
+        raw_ts = payload.get("timestamp")
+        if raw_ts is None:
+            ts = time.time()
+        elif isinstance(raw_ts, bool):
+            raise MalformedInputError("Generic webhook 'timestamp' must be numeric.")
+        else:
+            try:
+                ts = float(raw_ts)
+            except (TypeError, ValueError) as exc:
+                raise MalformedInputError("Generic webhook 'timestamp' must be numeric.") from exc
+
+        raw_meta = payload.get("metadata")
+        if raw_meta is None:
+            meta: Dict[str, Any] = {}
+        elif isinstance(raw_meta, dict):
+            meta = dict(raw_meta)
+        else:
+            raise MalformedInputError("Generic webhook 'metadata' must be a JSON object.")
+
         lang = str(payload.get("preferred_language") or detect_preferred_language(text))
         consent = parse_bool_strict(payload.get("consent_to_contact", True), "consent_to_contact")
         evidence = str(payload.get("consent_evidence") or f"webhook_event:{event_id}")
         handle = str(payload.get("customer_handle") or f"wh_{conv_id[:16]}")
         req_sku = payload.get("requested_sku")
 
+        # Always use authoritative server-supplied tenant_id (never trust payload["tenant_id"]).
         return [
             ChannelInboundEvent(
                 channel="webhook",
@@ -143,9 +165,9 @@ class GenericWebhookAdapter(ChannelAdapter):
                 consent_to_contact=consent,
                 consent_evidence=evidence,
                 timestamp=ts,
-                tenant_id=str(payload.get("tenant_id") or tenant_id),
+                tenant_id=tenant_id,
                 requested_sku=str(req_sku) if req_sku else None,
-                metadata=dict(payload.get("metadata") or {}),
+                metadata=meta,
             )
         ], []
 
@@ -160,12 +182,15 @@ class GenericWebhookAdapter(ChannelAdapter):
     ) -> OutboundSendResult:
         if not self.outbound_url:
             raise ChannelError("Generic webhook outbound_url is not configured.")
-        url = validate_outbound_url(
-            self.outbound_url,
-            allow_loopback=self.allow_loopback,
-            allow_http_loopback=self.allow_loopback,
-        )
-        parsed = urlsplit(url)
+        try:
+            conn, path, host_header = open_validated_connection(
+                self.outbound_url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+            )
+        except SSRFError as exc:
+            raise ChannelError(f"Webhook outbound_url blocked by SSRF policy: {exc}") from exc
+
         payload = {
             "idempotency_key": idempotency_key,
             "target": target,
@@ -176,6 +201,7 @@ class GenericWebhookAdapter(ChannelAdapter):
         raw_body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ts = str(int(time.time()))
         headers = {
+            "Host": host_header,
             "Content-Type": "application/json",
             "Content-Length": str(len(raw_body)),
             "Idempotency-Key": idempotency_key,
@@ -187,11 +213,6 @@ class GenericWebhookAdapter(ChannelAdapter):
             sig = compute_hmac_sha256_hex(out_secret, f"{ts}.".encode("utf-8") + raw_body)
             headers["X-TijaraGuard-Signature"] = f"sha256={sig}"
 
-        conn = (
-            http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-        )
         try:
             try:
                 conn.connect()
@@ -202,7 +223,7 @@ class GenericWebhookAdapter(ChannelAdapter):
                     uncertain=False,
                     error=scrub_secrets_from_text(str(exc), (out_secret,)),
                 )
-            conn.request("POST", parsed.path or "/", body=raw_body, headers=headers)
+            conn.request("POST", path, body=raw_body, headers=headers)
             resp = conn.getresponse()
             raw_resp = resp.read(65536)
             if resp.status in (200, 201, 202):
@@ -234,19 +255,21 @@ class GenericWebhookAdapter(ChannelAdapter):
     def lookup_receipt(self, delivery_key: str) -> Optional[OutboundSendResult]:
         if not self.receipt_lookup_url:
             return None
-        url = validate_outbound_url(
-            f"{self.receipt_lookup_url.rstrip('/')}/{delivery_key}",
-            allow_loopback=self.allow_loopback,
-            allow_http_loopback=self.allow_loopback,
-        )
-        parsed = urlsplit(url)
-        conn = (
-            http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-        )
+        lookup_url = f"{self.receipt_lookup_url.rstrip('/')}/{delivery_key}"
         try:
-            conn.request("GET", parsed.path, headers={"Accept": "application/json", "Connection": "close"})
+            conn, path, host_header = open_validated_connection(
+                lookup_url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+            )
+        except SSRFError:
+            return None
+        try:
+            conn.request(
+                "GET",
+                path,
+                headers={"Host": host_header, "Accept": "application/json", "Connection": "close"},
+            )
             resp = conn.getresponse()
             raw_resp = resp.read(65536)
             if resp.status == 200:

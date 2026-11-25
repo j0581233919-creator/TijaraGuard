@@ -62,16 +62,30 @@ def attach_privacy_log_filter(
     cfg: TijaraGuardConfig,
     pipeline: TijaraGuardPipeline,
 ) -> SecretAndPIIRedactingLogFilter:
-    """Attaches a secret & BayanGate PII redacting filter to the tijaraguard root logger."""
-    tg_logger = logging.getLogger("tijaraguard")
-    for flt in list(tg_logger.filters):
-        if isinstance(flt, SecretAndPIIRedactingLogFilter):
-            tg_logger.removeFilter(flt)
+    """Attaches a secret & BayanGate PII redacting filter to tijaraguard loggers and handlers."""
     flt = SecretAndPIIRedactingLogFilter(
         privacy_gate=pipeline.privacy_gate,
         secrets_provider=cfg.secret_values_for_scrubbing,
     )
-    tg_logger.addFilter(flt)
+    logger_names = (
+        "tijaraguard",
+        "tijaraguard.pipeline",
+        "tijaraguard.api",
+        "tijaraguard.providers",
+        "tijaraguard.channels",
+        "tijaraguard.cli",
+    )
+    for lname in logger_names:
+        lg = logging.getLogger(lname)
+        for existing in list(lg.filters):
+            if isinstance(existing, SecretAndPIIRedactingLogFilter):
+                lg.removeFilter(existing)
+        lg.addFilter(flt)
+        for h in lg.handlers:
+            for existing in list(h.filters):
+                if isinstance(existing, SecretAndPIIRedactingLogFilter):
+                    h.removeFilter(existing)
+            h.addFilter(flt)
     return flt
 
 

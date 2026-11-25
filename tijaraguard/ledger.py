@@ -85,6 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_drafts_tenant_state
 CREATE INDEX IF NOT EXISTS idx_drafts_tenant_conv
     ON drafts(tenant_id, conversation_id);
 
+CREATE INDEX IF NOT EXISTS idx_drafts_receipt_id
+    ON drafts(tenant_id, receipt_id);
+
 CREATE TABLE IF NOT EXISTS approvals (
     lease_id TEXT PRIMARY KEY,
     draft_id TEXT NOT NULL REFERENCES drafts(draft_id),
@@ -204,6 +207,7 @@ _ALLOWED_DELIVERY_TRANSITIONS: Dict[str, set[str]] = {
     },
     DraftState.ACCEPTED_DELIVERY.value: {
         DraftState.DELIVERED.value,
+        DraftState.FAILED_DELIVERY.value,
     },
 }
 
@@ -252,7 +256,12 @@ def verify_audit_database_readonly(db_path: str | Path) -> Tuple[bool, int, List
                 not trig_sql
                 or required_clause not in trig_sql
                 or " WHEN " in trig_sql
+                or " WHERE " in trig_sql
                 or "RAISE(ABORT" not in trig_sql
+                or not re.search(
+                    rf"{re.escape(required_clause)}\s+(?:FOR EACH ROW\s+)?BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,[^)]+\)\s*;\s*END$",
+                    trig_sql,
+                )
             ):
                 errors.append(f"Missing or weakened immutability trigger: {req_trig}")
 
@@ -373,7 +382,7 @@ def restore_ledger_backup(backup_path: str | Path, target_db_path: str | Path) -
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     harden_state_permissions(dst.parent, is_dir=True)
-    tmp_dst = dst.with_name(f".{dst.name}.restore.{os.getpid()}.tmp")
+    tmp_dst = dst.with_name(f".{dst.name}.restore.{os.getpid()}.{secrets.token_hex(6)}.tmp")
     shutil.copy2(src, tmp_dst)
     os.replace(tmp_dst, dst)
     for sidecar in (Path(f"{dst}-wal"), Path(f"{dst}-shm")):
@@ -423,6 +432,10 @@ class ApprovalLedger:
                 )
                 conn.execute(f"PRAGMA user_version = {_LATEST_SCHEMA_VERSION}")
                 return
+            if version >= 2:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_drafts_receipt_id ON drafts(tenant_id, receipt_id)"
+                )
 
         if version < 2:
             self._migrate_v1_to_v2()
@@ -512,6 +525,9 @@ class ApprovalLedger:
                 "CREATE INDEX IF NOT EXISTS idx_drafts_tenant_conv ON drafts(tenant_id, conversation_id)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_drafts_receipt_id ON drafts(tenant_id, receipt_id)"
+            )
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
@@ -566,11 +582,11 @@ class ApprovalLedger:
                 (2, _utc_now_iso(), "Migrate v1 drafts/ledger to v2 product schema"),
             )
             conn.execute("PRAGMA user_version = 2")
-            conn.commit()
-            conn.execute("PRAGMA foreign_keys=ON")
             fk_issues = conn.execute("PRAGMA foreign_key_check").fetchall()
             if fk_issues:
-                raise MalformedInputError("Foreign key check failed after v1->v2 migration.")
+                raise MalformedInputError("Foreign key check failed during v1->v2 migration.")
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=ON")
         except BaseException:
             try:
                 conn.rollback()
@@ -690,85 +706,90 @@ class ApprovalLedger:
             }
         )
 
-        with self._connect(write=True) as conn:
-            conn.execute(
-                """
-                INSERT INTO drafts(
-                    draft_id, tenant_id, message_id, conversation_id, customer_handle, contact_ref,
-                    contact_channel, sku, language, redacted_inquiry, pii_summary_json,
-                    subject, body, consent_to_contact, consent_evidence,
-                    verification_status, verification_report_json, payload_sha256,
-                    state, ai_provider, ai_model, ai_metadata_json, channel_metadata_json,
-                    retention_expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    evaluation.draft_id,
-                    envelope.tenant_id,
-                    envelope.message_id,
-                    envelope.conversation_id,
-                    envelope.customer_handle,
-                    envelope.contact_ref,
-                    envelope.contact_channel,
-                    evaluation.sku,
-                    evaluation.language,
-                    envelope.redacted_text,
-                    canonical_json(envelope.pii_summary),
-                    evaluation.subject,
-                    evaluation.body,
-                    1 if envelope.consent_to_contact else 0,
-                    envelope.consent_evidence,
-                    evaluation.verification_status,
-                    canonical_json(evaluation.verification_report_dict),
-                    payload_sha256,
-                    target_state,
-                    evaluation.ai_provider,
-                    evaluation.ai_model,
-                    canonical_json(evaluation.ai_metadata or {}),
-                    canonical_json(envelope.channel_metadata or {}),
-                    ret_exp,
-                    now_iso,
-                    now_iso,
-                ),
-            )
+        try:
+            with self._connect(write=True) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO drafts(
+                        draft_id, tenant_id, message_id, conversation_id, customer_handle, contact_ref,
+                        contact_channel, sku, language, redacted_inquiry, pii_summary_json,
+                        subject, body, consent_to_contact, consent_evidence,
+                        verification_status, verification_report_json, payload_sha256,
+                        state, ai_provider, ai_model, ai_metadata_json, channel_metadata_json,
+                        retention_expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evaluation.draft_id,
+                        envelope.tenant_id,
+                        envelope.message_id,
+                        envelope.conversation_id,
+                        envelope.customer_handle,
+                        envelope.contact_ref,
+                        envelope.contact_channel,
+                        evaluation.sku,
+                        evaluation.language,
+                        envelope.redacted_text,
+                        canonical_json(envelope.pii_summary),
+                        evaluation.subject,
+                        evaluation.body,
+                        1 if envelope.consent_to_contact else 0,
+                        envelope.consent_evidence,
+                        evaluation.verification_status,
+                        canonical_json(evaluation.verification_report_dict),
+                        payload_sha256,
+                        target_state,
+                        evaluation.ai_provider,
+                        evaluation.ai_model,
+                        canonical_json(evaluation.ai_metadata or {}),
+                        canonical_json(envelope.channel_metadata or {}),
+                        ret_exp,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
 
-            self._append_audit_event(
-                conn,
-                draft_id=evaluation.draft_id,
-                event_type="DRAFT_INGESTED",
-                from_state=None,
-                to_state=DraftState.INGESTED.value,
-                actor="gate1_privacy",
-                payload_sha256=payload_sha256,
-                details={
-                    "tenant_id": envelope.tenant_id,
-                    "message_id": envelope.message_id,
-                    "contact_ref": envelope.contact_ref,
-                    "pii_entity_count": envelope.pii_summary.get("entity_count", 0),
-                },
-            )
-            self._append_audit_event(
-                conn,
-                draft_id=evaluation.draft_id,
-                event_type="VERIFICATION_RECORDED",
-                from_state=DraftState.INGESTED.value,
-                to_state=target_state,
-                actor="gate2_commerce",
-                payload_sha256=payload_sha256,
-                details={
-                    "verification_status": evaluation.verification_status,
-                    "reason_count": len(evaluation.reasons),
-                    "reasons": evaluation.reasons,
-                    "detected_dialect": evaluation.detected_dialect,
-                    "sku": evaluation.sku,
-                    "ai_provider": evaluation.ai_provider,
-                    "ai_model": evaluation.ai_model,
-                },
-            )
-            row = conn.execute(
-                "SELECT * FROM drafts WHERE draft_id=?", (evaluation.draft_id,)
-            ).fetchone()
-            return dict(row)
+                self._append_audit_event(
+                    conn,
+                    draft_id=evaluation.draft_id,
+                    event_type="DRAFT_INGESTED",
+                    from_state=None,
+                    to_state=DraftState.INGESTED.value,
+                    actor="gate1_privacy",
+                    payload_sha256=payload_sha256,
+                    details={
+                        "tenant_id": envelope.tenant_id,
+                        "message_id": envelope.message_id,
+                        "contact_ref": envelope.contact_ref,
+                        "pii_entity_count": envelope.pii_summary.get("entity_count", 0),
+                    },
+                )
+                self._append_audit_event(
+                    conn,
+                    draft_id=evaluation.draft_id,
+                    event_type="VERIFICATION_RECORDED",
+                    from_state=DraftState.INGESTED.value,
+                    to_state=target_state,
+                    actor="gate2_commerce",
+                    payload_sha256=payload_sha256,
+                    details={
+                        "verification_status": evaluation.verification_status,
+                        "reason_count": len(evaluation.reasons),
+                        "reasons": evaluation.reasons,
+                        "detected_dialect": evaluation.detected_dialect,
+                        "sku": evaluation.sku,
+                        "ai_provider": evaluation.ai_provider,
+                        "ai_model": evaluation.ai_model,
+                    },
+                )
+                row = conn.execute(
+                    "SELECT * FROM drafts WHERE draft_id=?", (evaluation.draft_id,)
+                ).fetchone()
+                return dict(row)
+        except sqlite3.IntegrityError as exc:
+            raise VerificationBlockedError(
+                f"Duplicate message_id '{envelope.message_id}' or draft conflict."
+            ) from exc
 
     def get_draft(self, draft_id: str, *, tenant_id: Optional[str] = None) -> Dict[str, Any]:
         """Fetches a draft record by draft_id (optionally scoped to tenant_id)."""
@@ -785,6 +806,29 @@ class ApprovalLedger:
             if row is None:
                 raise MalformedInputError(f"Unknown draft_id '{draft_id}'.")
             return dict(row)
+
+    def get_draft_by_receipt_id(
+        self,
+        receipt_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        channel: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Looks up a draft by its normalized MessageShield receipt_id."""
+        clauses = ["receipt_id=?"]
+        params: List[Any] = [receipt_id]
+        if tenant_id is not None:
+            clauses.append("tenant_id=?")
+            params.append(tenant_id)
+        if channel is not None:
+            clauses.append("contact_channel=?")
+            params.append(channel.strip().lower())
+        with self._connect(write=False) as conn:
+            row = conn.execute(
+                f"SELECT * FROM drafts WHERE {' AND '.join(clauses)} LIMIT 1",
+                tuple(params),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def list_drafts(
         self,
@@ -878,15 +922,6 @@ class ApprovalLedger:
             row = conn.execute(
                 "SELECT * FROM approvals WHERE draft_id=? AND consumed=0 AND revoked=0",
                 (draft_id,),
-            ).fetchone()
-            return dict(row) if row is not None else None
-
-    def get_draft_by_delivery_key(self, delivery_key: str) -> Optional[Dict[str, Any]]:
-        """Looks up a draft by its MessageShield delivery_key."""
-        with self._connect(write=False) as conn:
-            row = conn.execute(
-                "SELECT * FROM drafts WHERE delivery_key=?",
-                (delivery_key,),
             ).fetchone()
             return dict(row) if row is not None else None
 
@@ -1190,11 +1225,14 @@ class ApprovalLedger:
         lease_id: str,
         approval_mac: str,
         mode: ExecutionMode,
+        expected_payload_sha256: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Atomically verifies payload integrity + HMAC lease and consumes single-use token."""
         if not is_valid_sha256_hex(approval_mac):
             raise ApprovalTamperError("Malformed approval_mac format.")
+        if expected_payload_sha256 is not None and not is_valid_sha256_hex(expected_payload_sha256):
+            raise ApprovalTamperError("Malformed expected_payload_sha256 format.")
 
         current_time = float(time.time() if now is None else now)
 
@@ -1240,8 +1278,14 @@ class ApprovalLedger:
                 and bool(str(draft["consent_evidence"]).strip())
                 and draft["verification_status"] == "PASS"
             )
+            caller_hash_ok = (
+                True
+                if expected_payload_sha256 is None
+                else hmac.compare_digest(live_hash, expected_payload_sha256.lower())
+            )
             hash_ok = (
                 consent_ok
+                and caller_hash_ok
                 and is_valid_sha256_hex(draft["payload_sha256"])
                 and is_valid_sha256_hex(approval["payload_sha256"])
                 and hmac.compare_digest(live_hash, draft["payload_sha256"].lower())
@@ -1408,8 +1452,9 @@ class ApprovalLedger:
         status: str = "RECEIVED",
         draft_id: Optional[str] = None,
     ) -> bool:
-        """Atomically records a channel event key; returns False if already seen (replay/dup)."""
+        """Atomically records a hashed channel event key; returns False if already seen."""
         event_key = sha256_hex(f"{tenant_id}:{channel}:{external_event_id}")
+        safe_ext_hash = sha256_hex(external_event_id)[:32]
         with self._connect(write=True) as conn:
             cur = conn.execute(
                 """
@@ -1422,7 +1467,7 @@ class ApprovalLedger:
                     event_key,
                     tenant_id,
                     channel,
-                    external_event_id,
+                    safe_ext_hash,
                     conversation_id,
                     time.time(),
                     status,
@@ -1446,6 +1491,21 @@ class ApprovalLedger:
             conn.execute(
                 "UPDATE channel_events SET status=?, draft_id=COALESCE(?, draft_id) WHERE event_key=?",
                 (status, draft_id, event_key),
+            )
+
+    def release_channel_event(
+        self,
+        channel: str,
+        external_event_id: str,
+        *,
+        tenant_id: str = "default",
+    ) -> None:
+        """Releases a PROCESSING channel event key on transient ingestion failure so retries succeed."""
+        event_key = sha256_hex(f"{tenant_id}:{channel}:{external_event_id}")
+        with self._connect(write=True) as conn:
+            conn.execute(
+                "DELETE FROM channel_events WHERE event_key=? AND status='PROCESSING' AND draft_id IS NULL",
+                (event_key,),
             )
 
     def record_provider_usage(
@@ -1545,21 +1605,24 @@ class ApprovalLedger:
         now_iso: Optional[str] = None,
         channel_event_max_age_seconds: int = 7 * 86400,
     ) -> Dict[str, int]:
-        """Scrubs expired terminal draft inquiry bodies & prunes old channel replay keys."""
+        """Scrubs expired non-active draft text/body & prunes old channel replay keys."""
         cutoff_iso = now_iso or _utc_now_iso()
         cutoff_epoch = time.time() - max(60, int(channel_event_max_age_seconds))
-        terminal_states = (
+        purgeable_states = (
             DraftState.DELIVERED.value,
             DraftState.REJECTED.value,
             DraftState.SHADOW_RECORDED.value,
             DraftState.FAILED_DELIVERY.value,
+            DraftState.VERIFIED_BLOCKED.value,
+            DraftState.ESCALATED.value,
         )
-        placeholders = ",".join("?" for _ in terminal_states)
+        placeholders = ",".join("?" for _ in purgeable_states)
         with self._connect(write=True) as conn:
             cur_drafts = conn.execute(
                 f"""
                 UPDATE drafts
                 SET redacted_inquiry='[PURGED_BY_RETENTION]',
+                    body='[PURGED_BY_RETENTION]',
                     consent_evidence='[PURGED_BY_RETENTION]',
                     channel_metadata_json='{{}}',
                     updated_at=?
@@ -1568,7 +1631,7 @@ class ApprovalLedger:
                   AND state IN ({placeholders})
                   AND redacted_inquiry != '[PURGED_BY_RETENTION]'
                 """,
-                (cutoff_iso, cutoff_iso, *terminal_states),
+                (cutoff_iso, cutoff_iso, *purgeable_states),
             )
             cur_events = conn.execute(
                 "DELETE FROM channel_events WHERE received_at <= ?",
@@ -1600,7 +1663,9 @@ class ApprovalLedger:
         target = Path(dest_path).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         harden_state_permissions(target.parent, is_dir=True)
-        tmp_target = target.with_name(f".{target.name}.bak.{os.getpid()}.tmp")
+        tmp_target = target.with_name(
+            f".{target.name}.bak.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+        )
 
         with self._connect(write=False) as src_conn:
             dst_conn = sqlite3.connect(str(tmp_target))
@@ -1622,10 +1687,36 @@ class ApprovalLedger:
             "permissions": perm_info,
         }
 
-    def list_audit_events(self, draft_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns ordered audit events."""
+    def list_audit_events(
+        self,
+        draft_id: Optional[str] = None,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returns ordered audit events, optionally filtered by draft_id and/or tenant_id."""
         with self._connect(write=False) as conn:
-            if draft_id is not None:
+            if tenant_id is not None:
+                if draft_id is not None:
+                    rows = conn.execute(
+                        """
+                        SELECT ae.* FROM audit_events ae
+                        INNER JOIN drafts d ON d.draft_id = ae.draft_id
+                        WHERE ae.draft_id=? AND d.tenant_id=?
+                        ORDER BY ae.seq ASC
+                        """,
+                        (draft_id, tenant_id),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT ae.* FROM audit_events ae
+                        LEFT JOIN drafts d ON d.draft_id = ae.draft_id
+                        WHERE d.tenant_id=? OR ae.draft_id='__RETENTION__'
+                        ORDER BY ae.seq ASC
+                        """,
+                        (tenant_id,),
+                    ).fetchall()
+            elif draft_id is not None:
                 rows = conn.execute(
                     "SELECT * FROM audit_events WHERE draft_id=? ORDER BY seq ASC",
                     (draft_id,),
@@ -1675,7 +1766,7 @@ class ApprovalLedger:
 
 
 class EphemeralRouteStore:
-    """Isolated SQLite store mapping (tenant_id, channel, contact_ref) -> outbound target.
+    """Isolated SQLite store mapping (tenant_id, channel, contact_ref, conv) -> outbound target.
 
     Kept strictly separate from ledger.sqlite3 so the immutable approval/audit ledger
     never persists raw phone numbers or external chat identifiers.
@@ -1725,11 +1816,11 @@ class EphemeralRouteStore:
                     tenant_id TEXT NOT NULL,
                     channel TEXT NOT NULL,
                     contact_ref TEXT NOT NULL,
+                    external_conversation_id TEXT NOT NULL DEFAULT '',
                     external_target TEXT NOT NULL,
-                    external_conversation_id TEXT,
                     updated_at REAL NOT NULL,
                     expires_at REAL NOT NULL,
-                    PRIMARY KEY (tenant_id, channel, contact_ref)
+                    PRIMARY KEY (tenant_id, channel, contact_ref, external_conversation_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_routes_expiry ON routes(expires_at);
                 """
@@ -1748,16 +1839,16 @@ class EphemeralRouteStore:
         validate_safe_id(tenant_id, "tenant_id")
         now = time.time()
         ttl = self.default_ttl_seconds if ttl_seconds is None else max(60, int(ttl_seconds))
+        conv_key = str(external_conversation_id or "")
         with self._connect(write=True) as conn:
             conn.execute(
                 """
                 INSERT INTO routes(
-                    tenant_id, channel, contact_ref, external_target,
-                    external_conversation_id, updated_at, expires_at
+                    tenant_id, channel, contact_ref, external_conversation_id,
+                    external_target, updated_at, expires_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant_id, channel, contact_ref) DO UPDATE SET
+                ON CONFLICT(tenant_id, channel, contact_ref, external_conversation_id) DO UPDATE SET
                     external_target=excluded.external_target,
-                    external_conversation_id=excluded.external_conversation_id,
                     updated_at=excluded.updated_at,
                     expires_at=excluded.expires_at
                 """,
@@ -1765,8 +1856,8 @@ class EphemeralRouteStore:
                     tenant_id,
                     channel.strip().lower(),
                     contact_ref,
+                    conv_key,
                     external_target,
-                    external_conversation_id,
                     now,
                     now + ttl,
                 ),
@@ -1778,25 +1869,51 @@ class EphemeralRouteStore:
         tenant_id: str,
         channel: str,
         contact_ref: str,
+        external_conversation_id: Optional[str] = None,
         now: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         current = float(time.time() if now is None else now)
+        ch = channel.strip().lower()
         with self._connect(write=False) as conn:
+            if external_conversation_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM routes
+                    WHERE tenant_id=? AND channel=? AND contact_ref=? AND external_conversation_id=? AND expires_at > ?
+                    """,
+                    (tenant_id, ch, contact_ref, str(external_conversation_id), current),
+                ).fetchone()
+                return dict(row) if row is not None else None
             row = conn.execute(
                 """
                 SELECT * FROM routes
                 WHERE tenant_id=? AND channel=? AND contact_ref=? AND expires_at > ?
+                ORDER BY updated_at DESC LIMIT 1
                 """,
-                (tenant_id, channel.strip().lower(), contact_ref, current),
+                (tenant_id, ch, contact_ref, current),
             ).fetchone()
             return dict(row) if row is not None else None
 
-    def delete(self, *, tenant_id: str, channel: str, contact_ref: str) -> int:
+    def delete(
+        self,
+        *,
+        tenant_id: str,
+        channel: str,
+        contact_ref: str,
+        external_conversation_id: Optional[str] = None,
+    ) -> int:
+        ch = channel.strip().lower()
         with self._connect(write=True) as conn:
-            cur = conn.execute(
-                "DELETE FROM routes WHERE tenant_id=? AND channel=? AND contact_ref=?",
-                (tenant_id, channel.strip().lower(), contact_ref),
-            )
+            if external_conversation_id is not None:
+                cur = conn.execute(
+                    "DELETE FROM routes WHERE tenant_id=? AND channel=? AND contact_ref=? AND external_conversation_id=?",
+                    (tenant_id, ch, contact_ref, str(external_conversation_id)),
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM routes WHERE tenant_id=? AND channel=? AND contact_ref=?",
+                    (tenant_id, ch, contact_ref),
+                )
             return int(cur.rowcount)
 
     def purge_expired(self, *, now: Optional[float] = None) -> int:

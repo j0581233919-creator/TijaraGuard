@@ -399,3 +399,235 @@ class TestChannels(unittest.TestCase):
         self.assertTrue(any(r["body"].get("private") is True for r in self.gw.outbound_requests))
         esc = pipe.escalate(ing_cw["draft_id"], actor="supervisor_1", reason="Needs custom quote")
         self.assertEqual(esc["state"], DraftState.ESCALATED.value)
+
+    def test_non_default_tenant_chatwoot_concurrency_pii_event_and_status_edge_cases(self) -> None:
+        from datetime import datetime, timezone
+        from tijaraguard.models import ChannelError, PrivacyViolationError
+        from tijaraguard.channels.base import ChannelStatusEvent
+
+        now_ts = int(time.time())
+        iso_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        wa = WhatsAppCloudAdapter(
+            WhatsAppConfig(
+                enabled=True,
+                phone_number_id="1234567890",
+                access_token="wa-access-token-secret",
+                verify_token="wa-verify-token-secret",
+                app_secret="wa-app-secret-key",
+                base_url=self.gw.base_url,
+            ),
+            allow_loopback=True,
+        )
+        tg = TelegramBotAdapter(
+            TelegramConfig(
+                enabled=True,
+                bot_token="123456:TGSecretBotTokenXYZ",
+                webhook_secret_token="tg-webhook-secret",
+                base_url=self.gw.base_url,
+            ),
+            allow_loopback=True,
+        )
+        cw = ChatwootAdapter(
+            ChatwootConfig(
+                enabled=True,
+                base_url=self.gw.base_url,
+                account_id="1",
+                api_access_token="cw-api-token-secret",
+                webhook_secret="cw-webhook-secret",
+            ),
+            allow_loopback=True,
+        )
+        wh = GenericWebhookAdapter(
+            GenericWebhookConfig(
+                enabled=True,
+                inbound_secret="wh-in-secret",
+                outbound_url=f"{self.gw.base_url}/webhook/outbound",
+            ),
+            allow_loopback=True,
+        )
+
+        # Chatwoot rejects path traversal conversation_id and missing created_at, accepts ISO-8601
+        with self.assertRaises(ChannelError):
+            cw.parse_inbound(
+                {
+                    "event": "message_created",
+                    "id": 1,
+                    "message_type": "incoming",
+                    "content": "hello",
+                    "created_at": iso_now,
+                    "conversation": {"id": "../../admin"},
+                }
+            )
+        with self.assertRaises(ReplayError):
+            cw.parse_inbound(
+                {
+                    "event": "message_created",
+                    "id": 2,
+                    "message_type": "incoming",
+                    "content": "hello",
+                    "conversation": {"id": 101},
+                }
+            )
+        # Timestamp-bound Chatwoot signature rejects unbound raw_body signature
+        raw_cw = b'{"event":"message_created"}'
+        unbound_sig = "sha256=" + compute_hmac_sha256_hex("cw-webhook-secret", raw_cw)
+        with self.assertRaises(WebhookSignatureError):
+            cw.verify_inbound_request(
+                {"X-Chatwoot-Timestamp": str(now_ts), "X-Chatwoot-Signature": unbound_sig},
+                raw_cw,
+            )
+
+        # Generic webhook ignores untrusted payload tenant_id
+        wh_ev, _ = wh.parse_inbound(
+            {
+                "event_id": "wh-t-1",
+                "conversation_id": "wh-c-1",
+                "target": "+966500001111",
+                "text": "كم سعر سماعة سوني WH-1000XM5؟",
+                "tenant_id": "victim_tenant",
+            },
+            tenant_id="acme",
+        )
+        self.assertEqual(wh_ev[0].tenant_id, "acme")
+
+        # Non-default tenant 'acme' full pipeline with fresh outbox + concurrent LIVE dispatches
+        routes = EphemeralRouteStore(self.tmpdir / "routes_acme.sqlite3")
+        pipe = TijaraGuardPipeline(
+            catalog=load_test_catalog(),
+            ledger_db_path=self.tmpdir / "ledger_acme.sqlite3",
+            approval_secret=make_secret_bytes(),
+            contact_hash_key=make_secret_bytes(),
+            mode=ExecutionMode.LIVE,
+            outbox_db_path=self.tmpdir / "fresh_outbox_acme.sqlite3",
+            channel_registry=ChannelRegistry({"whatsapp": wa, "telegram": tg, "chatwoot": cw, "webhook": wh}),
+            route_store=routes,
+            tenant_id="acme",
+            allow_loopback_channels=True,
+        )
+
+        # Pre-Gate-1 PII in webhook event_id must NEVER touch ledger.sqlite3
+        bad_wh_ev, _ = wh.parse_inbound(
+            {
+                "event_id": SYNTH_SAUDI_ID,
+                "conversation_id": "wh-conv-safe",
+                "target": "+966500001111",
+                "text": "كم سعر سماعة سوني WH-1000XM5؟",
+            },
+            tenant_id="acme",
+        )
+        with self.assertRaises(PrivacyViolationError):
+            pipe.ingest_channel_event(bad_wh_ev[0])
+        self.assertEqual(
+            scan_sqlite_for_secrets(self.tmpdir / "ledger_acme.sqlite3", [SYNTH_SAUDI_ID]),
+            [],
+        )
+
+        # Same Chatwoot customer with two concurrent conversations (101 & 102) routes accurately
+        cw_101, _ = cw.parse_inbound(
+            {
+                "event": "message_created",
+                "id": 5001,
+                "message_type": "incoming",
+                "content": "كم سعر ماكينة قهوة ديلونجي EC685؟",
+                "created_at": iso_now,
+                "conversation": {"id": 101},
+                "sender": {"name": "cust", "phone_number": SYNTH_PHONE_INTL},
+            },
+            tenant_id="acme",
+        )
+        cw_102, _ = cw.parse_inbound(
+            {
+                "event": "message_created",
+                "id": 5002,
+                "message_type": "incoming",
+                "content": "كم سعر ماكينة قهوة ديلونجي EC685؟",
+                "created_at": iso_now,
+                "conversation": {"id": 102},
+                "sender": {"name": "cust", "phone_number": SYNTH_PHONE_INTL},
+            },
+            tenant_id="acme",
+        )
+        d101 = pipe.ingest_channel_event(cw_101[0])
+        d102 = pipe.ingest_channel_event(cw_102[0])
+        self.assertEqual(d101["tenant_id"], "acme")
+
+        # Cross-conversation explicit target rejected
+        tok101 = pipe.approve(
+            d101["draft_id"],
+            reviewer_id="sup",
+            expected_payload_sha256=d101["payload_sha256"],
+        )
+        with self.assertRaises(DeliveryError):
+            pipe.dispatch(d101["draft_id"], tok101, recipient_target="102")
+
+        tok102 = pipe.approve(
+            d102["draft_id"],
+            reviewer_id="sup",
+            expected_payload_sha256=d102["payload_sha256"],
+        )
+        # Concurrent LIVE dispatches succeed cleanly on fresh outbox
+        results: List[str] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def run_disp(did: str, tk: Any) -> None:
+            barrier.wait()
+            out = pipe.dispatch(did, tk)
+            with lock:
+                results.append(out.state)
+
+        t1 = threading.Thread(target=run_disp, args=(d101["draft_id"], tok101))
+        t2 = threading.Thread(target=run_disp, args=(d102["draft_id"], tok102))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        self.assertEqual(results, [DraftState.DELIVERED.value, DraftState.DELIVERED.value])
+
+        # Telegram LIVE dispatch + process_status_event 'failed' handling & non-DELIVERED accuracy
+        tg_ev, _ = tg.parse_inbound(
+            {
+                "update_id": 7001,
+                "message": {
+                    "message_id": 12,
+                    "date": now_ts,
+                    "chat": {"id": 998877},
+                    "from": {"username": "tg_acme_user"},
+                    "text": "كم سعر ماكينة قهوة ديلونجي EC685؟",
+                },
+            },
+            tenant_id="acme",
+        )
+        ing_tg = pipe.ingest_channel_event(tg_ev[0])
+        tok_tg = pipe.approve(
+            ing_tg["draft_id"],
+            reviewer_id="sup",
+            expected_payload_sha256=ing_tg["payload_sha256"],
+        )
+        out_tg = pipe.dispatch(ing_tg["draft_id"], tok_tg, confirm_delivered=False)
+        self.assertEqual(out_tg.state, DraftState.ACCEPTED_DELIVERY.value)
+
+        # Async WhatsApp/channel failed status transitions ACCEPTED_DELIVERY -> FAILED_DELIVERY
+        st_fail = pipe.process_status_event(
+            ChannelStatusEvent(
+                channel="telegram",
+                external_event_id="st-fail-1",
+                external_message_id="7711",
+                status="failed",
+                timestamp=float(now_ts),
+                error="blocked_by_user",
+            )
+        )
+        self.assertEqual(st_fail["state"], DraftState.FAILED_DELIVERY.value)
+        # Subsequent delivered callback on FAILED_DELIVERY must NOT claim DELIVERED
+        st_late = pipe.process_status_event(
+            ChannelStatusEvent(
+                channel="telegram",
+                external_event_id="st-late-1",
+                external_message_id="7711",
+                status="delivered",
+                timestamp=float(now_ts),
+            )
+        )
+        self.assertEqual(st_late["state"], DraftState.FAILED_DELIVERY.value)

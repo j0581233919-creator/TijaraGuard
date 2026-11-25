@@ -1,17 +1,20 @@
-"""Core security controls: SSRF validation, HMAC signatures, auth, rate limiting, and scrubbing."""
+"""Core security controls: SSRF validation, IP-pinned HTTP, HMAC signatures, auth, rate limiting, and scrubbing."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import logging
 import math
 import os
 import re
 import socket
+import ssl
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, Mapping, Optional, Set, Tuple
@@ -49,15 +52,36 @@ _SECRET_PATTERNS = [
     re.compile(r"(/bot)[0-9]{5,}:[A-Za-z0-9_-]{10,}"),
     re.compile(r"\b(sk-[A-Za-z0-9_-]{10,})\b"),
     re.compile(r"\b(AIza[0-9A-Za-z_-]{16,})\b"),
-    re.compile(r"(x-(?:api|goog)-key\s*[:=]\s*)\S+", re.IGNORECASE),
+    re.compile(r"(x-(?:api|goog|goog-api)-key\s*[:=]\s*)\S+", re.IGNORECASE),
 ]
 
-_FORMULA_PREFIX_CHARS = frozenset({"=", "+", "-", "@", "\t", "\r"})
+_FORMULA_PREFIX_CHARS = frozenset({"=", "+", "-", "@", "\t", "\r", "\n"})
 
 
-def _is_forbidden_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> bool:
+def _is_forbidden_ip(
+    ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    allow_loopback: bool,
+) -> bool:
+    """Rejects all non-global IPs (including CGNAT/mapped/6to4/Teredo), except explicit literal loopback."""
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            return _is_forbidden_ip(ip_obj.ipv4_mapped, allow_loopback=False)
+        if ip_obj.sixtofour is not None:
+            if _is_forbidden_ip(ip_obj.sixtofour, allow_loopback=False):
+                return True
+        if ip_obj.teredo is not None:
+            for inner in ip_obj.teredo:
+                if _is_forbidden_ip(inner, allow_loopback=False):
+                    return True
+
     if ip_obj.is_loopback:
         return not allow_loopback
+
+    # Require global unicast address (blocks RFC1918, 100.64.0.0/10 CGNAT, 169.254/16, etc.)
+    if not ip_obj.is_global:
+        return True
+
     return (
         ip_obj.is_private
         or ip_obj.is_link_local
@@ -67,14 +91,11 @@ def _is_forbidden_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, a
     )
 
 
-def validate_outbound_url(
+def _validate_url_syntax(
     url: str,
     *,
-    allow_loopback: bool = False,
     allow_http_loopback: bool = False,
-    allowed_hosts: Optional[Set[str]] = None,
-) -> str:
-    """Validates an outbound URL against SSRF, credentials-in-URL, and unsafe scheme rules."""
+) -> Tuple[str, str, str, int, bool]:
     if not isinstance(url, str) or not url.strip():
         raise SSRFError("Outbound URL must be a non-empty string.")
     if len(url) > 2048 or any(ord(c) <= 32 or ord(c) == 127 for c in url):
@@ -95,47 +116,158 @@ def validate_outbound_url(
 
     host = parsed.hostname.lower()
     is_literal_loopback = host in ("127.0.0.1", "::1")
-    if scheme == "http":
-        if not (allow_http_loopback and is_literal_loopback):
-            raise SSRFError("Plain HTTP is prohibited except for explicit literal loopback testing.")
+    if scheme == "http" and not (allow_http_loopback and is_literal_loopback):
+        raise SSRFError("Plain HTTP is prohibited except for explicit literal loopback testing.")
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return url.rstrip("/"), scheme, host, port, is_literal_loopback
+
+
+def resolve_and_validate_url(
+    url: str,
+    *,
+    allow_loopback: bool = False,
+    allow_http_loopback: bool = False,
+    allowed_hosts: Optional[Set[str]] = None,
+    require_dns: bool = True,
+) -> Tuple[str, str, Optional[str], int, str]:
+    """Validates URL and resolves safe pinned IP, preventing DNS rebinding TOCTOU."""
+    normalized, scheme, host, port, is_literal_loopback = _validate_url_syntax(
+        url,
+        allow_http_loopback=allow_http_loopback,
+    )
 
     explicitly_allowed = allowed_hosts is not None and host in {h.lower() for h in allowed_hosts}
-    if explicitly_allowed:
-        return url.rstrip("/")
-
-    # Check literal IP first
     try:
         literal_ip = ipaddress.ip_address(host)
     except ValueError:
         literal_ip = None
 
     if literal_ip is not None:
-        if _is_forbidden_ip(literal_ip, allow_loopback=(allow_loopback and is_literal_loopback)):
+        if not explicitly_allowed and _is_forbidden_ip(
+            literal_ip,
+            allow_loopback=(allow_loopback and is_literal_loopback),
+        ):
             raise SSRFError(f"Outbound IP address '{host}' is blocked by SSRF policy.")
-        return url.rstrip("/")
+        return normalized, scheme, str(literal_ip), port, host
 
-    # Reject localhost hostname unless explicitly allowed via literal loopback
-    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+    if not explicitly_allowed and (
+        host == "localhost" or host.endswith(".localhost") or host.endswith(".local")
+    ):
         raise SSRFError(f"Outbound hostname '{host}' is blocked by SSRF policy.")
 
-    # Resolve DNS if available and verify all resolved addresses are safe
     try:
-        addr_infos = socket.getaddrinfo(host, parsed.port or (443 if scheme == "https" else 80), type=socket.SOCK_STREAM)
-    except OSError:
-        # Offline environments without DNS cannot resolve external hostnames; hostname rules above still hold.
-        return url.rstrip("/")
+        addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        if require_dns:
+            raise SSRFError(f"DNS resolution failed for outbound host '{host}'.") from exc
+        return normalized, scheme, None, port, host
 
+    chosen_ip: Optional[str] = None
     for info in addr_infos:
-        sockaddr = info[4]
-        ip_str = sockaddr[0].split("%")[0]
+        ip_str = info[4][0].split("%")[0]
         try:
             resolved_ip = ipaddress.ip_address(ip_str)
         except ValueError:
             continue
-        if _is_forbidden_ip(resolved_ip, allow_loopback=allow_loopback):
+        # Never allow DNS-resolved loopback even when allow_loopback=True (only literal 127.0.0.1/::1)
+        if not explicitly_allowed and _is_forbidden_ip(resolved_ip, allow_loopback=False):
             raise SSRFError(f"Resolved IP '{ip_str}' for '{host}' is blocked by SSRF policy.")
+        if chosen_ip is None:
+            chosen_ip = str(resolved_ip)
 
-    return url.rstrip("/")
+    if chosen_ip is None and require_dns:
+        raise SSRFError(f"No valid IP addresses resolved for '{host}'.")
+    return normalized, scheme, chosen_ip, port, host
+
+
+def validate_outbound_url(
+    url: str,
+    *,
+    allow_loopback: bool = False,
+    allow_http_loopback: bool = False,
+    allowed_hosts: Optional[Set[str]] = None,
+    require_dns: bool = False,
+) -> str:
+    """Validates an outbound URL against SSRF, credentials-in-URL, and unsafe scheme rules."""
+    normalized, _scheme, _ip, _port, _host = resolve_and_validate_url(
+        url,
+        allow_loopback=allow_loopback,
+        allow_http_loopback=allow_http_loopback,
+        allowed_hosts=allowed_hosts,
+        require_dns=require_dns,
+    )
+    return normalized
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that dials a pre-validated IP while verifying TLS cert against SNI hostname."""
+
+    def __init__(
+        self,
+        resolved_ip: str,
+        sni_hostname: str,
+        port: int,
+        *,
+        timeout: float,
+        context: Optional[ssl.SSLContext] = None,
+    ) -> None:
+        super().__init__(
+            sni_hostname,
+            port=port,
+            timeout=timeout,
+            context=context or ssl.create_default_context(),
+        )
+        self._resolved_ip = resolved_ip
+        self._sni_hostname = sni_hostname
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._resolved_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(sock, server_hostname=self._sni_hostname)
+
+
+def open_validated_connection(
+    url: str,
+    *,
+    timeout: float,
+    allow_loopback: bool = False,
+    ssl_context: Optional[ssl.SSLContext] = None,
+) -> Tuple[http.client.HTTPConnection, str, str]:
+    """Resolves, SSRF-validates, and opens a DNS-pinned HTTP/HTTPS connection.
+
+    Returns (connection, path_and_query, host_header).
+    """
+    normalized, scheme, resolved_ip, port, orig_host = resolve_and_validate_url(
+        url,
+        allow_loopback=allow_loopback,
+        allow_http_loopback=allow_loopback,
+        require_dns=True,
+    )
+    assert resolved_ip is not None
+    parsed = urlsplit(normalized)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    host_header = parsed.netloc
+
+    if scheme == "https":
+        conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
+            resolved_ip,
+            orig_host,
+            port,
+            timeout=timeout,
+            context=ssl_context,
+        )
+    else:
+        conn = http.client.HTTPConnection(resolved_ip, port=port, timeout=timeout)
+    return conn, path, host_header
 
 
 def compute_hmac_sha256_hex(secret: str | bytes, payload: bytes) -> str:
@@ -224,7 +356,6 @@ class SlidingWindowRateLimiter:
         cutoff = current - self.window_seconds
         with self._lock:
             if key not in self._buckets and len(self._buckets) >= self.max_keys:
-                # Evict oldest idle bucket to bound memory
                 oldest_key = min(
                     self._buckets.keys(),
                     key=lambda k: self._buckets[k][-1] if self._buckets[k] else -1.0,
@@ -247,7 +378,7 @@ def sanitize_csv_cell(value: Any) -> str:
     text = str(value)
     if not text:
         return ""
-    stripped = text.lstrip(" ")
+    stripped = text.lstrip()
     if text[0] in _FORMULA_PREFIX_CHARS or (stripped and stripped[0] in _FORMULA_PREFIX_CHARS):
         return "'" + text
     return text
@@ -270,7 +401,7 @@ def scrub_secrets_from_text(text: str, secrets_to_mask: Iterable[str] = ()) -> s
 
 
 class SecretAndPIIRedactingLogFilter(logging.Filter):
-    """Logging filter that strips secrets and optional BayanGate PII from log messages."""
+    """Logging filter that strips secrets and optional BayanGate PII from messages and tracebacks."""
 
     def __init__(self, *, privacy_gate: Any = None, secrets_provider: Any = None) -> None:
         super().__init__()
@@ -280,20 +411,32 @@ class SecretAndPIIRedactingLogFilter(logging.Filter):
     def set_privacy_gate(self, privacy_gate: Any) -> None:
         self._privacy_gate = privacy_gate
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            rendered = record.getMessage()
-        except Exception:
-            rendered = str(record.msg)
-        secrets_list = self._secrets_provider() if callable(self._secrets_provider) else ()
-        cleaned = scrub_secrets_from_text(rendered, secrets_list)
+    def _scrub(self, text: str, secrets_list: Iterable[str]) -> str:
+        cleaned = scrub_secrets_from_text(text, secrets_list)
         if self._privacy_gate is not None:
             try:
                 cleaned = self._privacy_gate.redact_text_full(cleaned)
             except Exception:
-                pass
-        record.msg = cleaned
+                return "[REDACTED_LOG_RECORD]"
+        return cleaned
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = "[REDACTED_LOG_RECORD]"
+        secrets_list = tuple(self._secrets_provider() if callable(self._secrets_provider) else ())
+        record.msg = self._scrub(rendered, secrets_list)
         record.args = ()
+
+        if record.exc_info and not record.exc_text:
+            try:
+                record.exc_text = "".join(traceback.format_exception(*record.exc_info))
+            except Exception:
+                record.exc_text = "[REDACTED_TRACEBACK]"
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = self._scrub(record.exc_text, secrets_list)
         return True
 
 

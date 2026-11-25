@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import socket
 import ssl
-import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
 from ..config import ChatwootConfig
 from ..models import ChannelError, parse_bool_strict
@@ -16,6 +16,7 @@ from ..security import (
     ReplayError,
     SSRFError,
     WebhookSignatureError,
+    open_validated_connection,
     scrub_secrets_from_text,
     validate_outbound_url,
     verify_hmac_sha256,
@@ -27,8 +28,40 @@ from .base import (
     ChannelStatusEvent,
     OutboundSendResult,
     detect_preferred_language,
-    normalize_receipt_id,
 )
+
+_CHATWOOT_CONV_ID_RE = re.compile(r"^[0-9]{1,20}$")
+
+
+def _validate_chatwoot_conv_id(raw_id: str) -> str:
+    clean = str(raw_id or "").strip()
+    if clean.startswith("cw-"):
+        clean = clean[3:]
+    if not _CHATWOOT_CONV_ID_RE.fullmatch(clean):
+        raise ChannelError("Chatwoot conversation_id must be 1-20 ASCII digits.")
+    return clean
+
+
+def _parse_chatwoot_timestamp(raw_ts: Any) -> float:
+    if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+        return float(raw_ts)
+    if isinstance(raw_ts, str):
+        s = raw_ts.strip()
+        if not s:
+            raise ReplayError("Empty Chatwoot timestamp.")
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        try:
+            iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError as exc:
+            raise ReplayError("Invalid Chatwoot created_at timestamp.") from exc
+    raise ReplayError("Missing or invalid Chatwoot created_at timestamp.")
 
 
 def _header_ci(headers: Mapping[str, str], name: str) -> Optional[str]:
@@ -62,10 +95,13 @@ class ChatwootAdapter(ChannelAdapter):
                 base,
                 allow_loopback=self.allow_loopback,
                 allow_http_loopback=self.allow_loopback,
+                require_dns=False,
             )
         except SSRFError as exc:
             raise ChannelError(f"Invalid Chatwoot base_url: {exc}") from exc
         self.account_id = str(config.account_id or "1").strip()
+        if not self.account_id.isdigit():
+            raise ChannelError("Chatwoot account_id must be numeric.")
         self.endpoint_url = f"{self.base_url}/api/v1/accounts/{self.account_id}/conversations"
 
     def verify_inbound_request(
@@ -78,6 +114,10 @@ class ChatwootAdapter(ChannelAdapter):
         if not secret:
             raise WebhookSignatureError("Chatwoot webhook_secret is not configured (fail closed).")
 
+        sig = _header_ci(headers, "X-Chatwoot-Signature")
+        if not sig:
+            raise WebhookSignatureError("Missing X-Chatwoot-Signature header.")
+
         ts_hdr = _header_ci(headers, "X-Chatwoot-Timestamp")
         if ts_hdr is not None:
             try:
@@ -86,22 +126,20 @@ class ChatwootAdapter(ChannelAdapter):
                 raise ReplayError("Invalid X-Chatwoot-Timestamp header.") from exc
             if not verify_timestamp_window(ts_val, max_skew_seconds=self.replay_window_seconds):
                 raise ReplayError("Chatwoot webhook timestamp outside replay window.")
-
-        sig = _header_ci(headers, "X-Chatwoot-Signature")
-        if not sig:
-            raise WebhookSignatureError("Missing X-Chatwoot-Signature header.")
-
-        # Accept either sha256=<hex> or raw hex HMAC over raw_body (or "{ts}.{body}" when ts present).
-        body_ok = verify_hmac_sha256(secret, raw_body, sig, prefix="sha256=") or verify_hmac_sha256(
-            secret, raw_body, sig, prefix=""
-        )
-        ts_body_ok = False
-        if ts_hdr is not None:
             signed_bytes = f"{ts_hdr}.".encode("utf-8") + raw_body
             ts_body_ok = verify_hmac_sha256(
                 secret, signed_bytes, sig, prefix="sha256="
             ) or verify_hmac_sha256(secret, signed_bytes, sig, prefix="")
-        if not (body_ok or ts_body_ok):
+            if not ts_body_ok:
+                raise WebhookSignatureError("Invalid timestamp-bound X-Chatwoot-Signature header.")
+            return
+
+        # Standard Chatwoot deployments without X-Chatwoot-Timestamp sign raw_body;
+        # parse_inbound() enforces created_at replay window.
+        body_ok = verify_hmac_sha256(secret, raw_body, sig, prefix="sha256=") or verify_hmac_sha256(
+            secret, raw_body, sig, prefix=""
+        )
+        if not body_ok:
             raise WebhookSignatureError("Invalid X-Chatwoot-Signature header.")
 
     def parse_inbound(
@@ -119,7 +157,6 @@ class ChatwootAdapter(ChannelAdapter):
 
         msg_type = payload.get("message_type")
         is_private = bool(payload.get("private", False))
-        # Ignore outgoing messages & private notes to prevent infinite echo loops.
         if is_private or str(msg_type).lower() not in ("incoming", "0"):
             return [], []
 
@@ -129,28 +166,29 @@ class ChatwootAdapter(ChannelAdapter):
 
         msg_id = str(payload.get("id") or "").strip()
         conv = payload.get("conversation") or {}
-        conv_id_raw = str(conv.get("id") or payload.get("conversation_id") or "").strip()
-        if not msg_id or not conv_id_raw:
+        if not isinstance(conv, dict):
+            raise ChannelError("Chatwoot conversation must be a JSON object.")
+        raw_conv = str(conv.get("id") or payload.get("conversation_id") or "").strip()
+        if not msg_id or not raw_conv:
             return [], []
+        conv_id_clean = _validate_chatwoot_conv_id(raw_conv)
 
         raw_ts = payload.get("created_at")
-        if raw_ts is not None:
-            try:
-                ts = float(raw_ts)
-            except (TypeError, ValueError) as exc:
-                raise ReplayError("Invalid Chatwoot created_at timestamp.") from exc
-            if not verify_timestamp_window(ts, max_skew_seconds=self.replay_window_seconds):
-                raise ReplayError("Chatwoot message created_at outside replay window.")
-        else:
-            ts = time.time()
+        if raw_ts is None:
+            raise ReplayError("Chatwoot message_created payload missing created_at timestamp.")
+        ts = _parse_chatwoot_timestamp(raw_ts)
+        if not verify_timestamp_window(ts, max_skew_seconds=self.replay_window_seconds):
+            raise ReplayError("Chatwoot message created_at outside replay window.")
 
         sender = payload.get("sender") or {}
-        handle = str(sender.get("name") or f"cw_contact_{conv_id_raw}")
+        if not isinstance(sender, dict):
+            sender = {}
+        handle = str(sender.get("name") or f"cw_contact_{conv_id_clean}")
         contact_target = str(
             sender.get("phone_number")
             or sender.get("email")
             or sender.get("identifier")
-            or f"chatwoot:{conv_id_raw}"
+            or f"chatwoot:{conv_id_clean}"
         )
 
         custom_attrs = (
@@ -164,11 +202,7 @@ class ChatwootAdapter(ChannelAdapter):
         except Exception:
             consent_bool = False
 
-        safe_conv = (
-            f"cw-{conv_id_raw}"
-            if conv_id_raw.replace("_", "").replace("-", "").isalnum()
-            else normalize_receipt_id("cw", conv_id_raw)
-        )
+        safe_conv = f"cw-{conv_id_clean}"
         return [
             ChannelInboundEvent(
                 channel="chatwoot",
@@ -176,14 +210,14 @@ class ChatwootAdapter(ChannelAdapter):
                 conversation_id=safe_conv[:80],
                 customer_handle=handle,
                 raw_contact_target=contact_target,
-                external_target=conv_id_raw,
+                external_target=conv_id_clean,
                 text=content,
                 preferred_language=detect_preferred_language(content),
                 consent_to_contact=consent_bool,
-                consent_evidence=f"chatwoot_conversation:{conv_id_raw}",
+                consent_evidence=f"chatwoot_conversation:{conv_id_clean}",
                 timestamp=ts,
                 tenant_id=tenant_id,
-                metadata={"chatwoot_conversation_id": conv_id_raw},
+                metadata={"chatwoot_conversation_id": conv_id_clean},
             )
         ], []
 
@@ -191,27 +225,27 @@ class ChatwootAdapter(ChannelAdapter):
         token = (self.config.api_access_token or "").strip()
         if not token:
             raise ChannelError("Chatwoot api_access_token is not configured.")
-        url = validate_outbound_url(
-            f"{self.base_url}/api/v1/accounts/{self.account_id}{path_suffix}",
-            allow_loopback=self.allow_loopback,
-            allow_http_loopback=self.allow_loopback,
-        )
-        parsed = urlsplit(url)
+        full_url = f"{self.base_url}/api/v1/accounts/{self.account_id}{path_suffix}"
+        try:
+            conn, path, host_header = open_validated_connection(
+                full_url,
+                timeout=self.timeout_seconds,
+                allow_loopback=self.allow_loopback,
+            )
+        except SSRFError as exc:
+            raise ChannelError(f"Chatwoot endpoint blocked by SSRF policy: {exc}") from exc
+
         raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
+            "Host": host_header,
             "api_access_token": token,
             "Content-Type": "application/json",
             "Content-Length": str(len(raw_body)),
             "Connection": "close",
         }
-        conn = (
-            http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=self.timeout_seconds)
-        )
         try:
             conn.connect()
-            conn.request("POST", parsed.path, body=raw_body, headers=headers)
+            conn.request("POST", path, body=raw_body, headers=headers)
             resp = conn.getresponse()
             raw_resp = resp.read(65536)
             data = json.loads(raw_resp.decode("utf-8")) if raw_resp else {}
@@ -228,7 +262,7 @@ class ChatwootAdapter(ChannelAdapter):
         conversation_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> OutboundSendResult:
-        conv_ref = target or (conversation_id or "").removeprefix("cw-")
+        conv_ref = _validate_chatwoot_conv_id(target or (conversation_id or ""))
         token = (self.config.api_access_token or "").strip()
         try:
             status, data = self._post_chatwoot(
@@ -237,6 +271,8 @@ class ChatwootAdapter(ChannelAdapter):
             )
             if status in (200, 201):
                 ext_id = str(data.get("id") or idempotency_key[:24])
+                from .base import normalize_receipt_id
+
                 return OutboundSendResult(
                     accepted=True,
                     external_message_id=ext_id,
@@ -253,7 +289,6 @@ class ChatwootAdapter(ChannelAdapter):
         except ChannelError:
             raise
         except (TimeoutError, socket.timeout, OSError, http.client.HTTPException, ssl.SSLError, ValueError) as exc:
-            # Distinguish connection-before-request vs uncertain if needed; conservative UNKNOWN on transport failure
             return OutboundSendResult(
                 accepted=False,
                 retryable=False,
@@ -263,7 +298,7 @@ class ChatwootAdapter(ChannelAdapter):
 
     def send_private_note(self, conversation_id: str, content: str) -> Dict[str, Any]:
         """Posts a private operator note invisible to the end customer."""
-        conv_ref = conversation_id.removeprefix("cw-")
+        conv_ref = _validate_chatwoot_conv_id(conversation_id)
         status, data = self._post_chatwoot(
             f"/conversations/{conv_ref}/messages",
             {"content": content, "message_type": "outgoing", "private": True},
@@ -274,7 +309,7 @@ class ChatwootAdapter(ChannelAdapter):
 
     def handoff_to_human(self, conversation_id: str, reason: str) -> Dict[str, Any]:
         """Marks conversation open for human agent attention and adds a private escalation note."""
-        conv_ref = conversation_id.removeprefix("cw-")
+        conv_ref = _validate_chatwoot_conv_id(conversation_id)
         self._post_chatwoot(
             f"/conversations/{conv_ref}/toggle_status",
             {"status": "open"},

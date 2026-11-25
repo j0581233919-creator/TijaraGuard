@@ -48,4 +48,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
 - [DEPLOYMENT.md](DEPLOYMENT.md) — Self-hosted / VPS / TLS / Docker deployment and backup/restore
 - [SECURITY.md](SECURITY.md) — Threat model, security controls, and honest residual boundaries
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — MIT upstream attributions (`BayanGate`, `CatalogCopilot`, `MessageShield`)
-- [HANDOFF.txt](HANDOFF.txt) — Comprehensive permanent engineering handoff
+- [LEDGER.md](LEDGER.md) — Authoritative engineering execution ledger

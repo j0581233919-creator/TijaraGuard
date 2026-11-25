@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TIJARAGUARD_HOST=0.0.0.0 \
     TIJARAGUARD_PORT=8080 \
-    TIJARAGUARD_STATE_DIR=/var/lib/tijaraguard
+    TIJARAGUARD_STATE_DIR=/var/lib/tijaraguard \
+    TIJARAGUARD_CATALOG_PATH=/app/examples/catalog.json
 
 RUN useradd --system --create-home --uid 10001 tijaraguard \
     && mkdir -p /app /var/lib/tijaraguard \

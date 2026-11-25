@@ -52,8 +52,8 @@ class GeminiProvider(AIProvider):
                 code=ProviderErrorCode.CONFIG_ERROR,
                 message=f"Missing API key ({self.config.api_key_env or 'GEMINI_API_KEY'}).",
             )
-        hdrs = {"x-goog-api-key": self._api_key}
-        hdrs.update(self.config.extra_headers)
+        hdrs = dict(self.config.extra_headers)
+        hdrs["x-goog-api-key"] = self._api_key
         return hdrs
 
     def generate(self, request: AIRequest) -> AIResponse:

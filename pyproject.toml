@@ -19,6 +19,7 @@ include = ["tijaraguard*"]
 
 [tool.setuptools.package-data]
 tijaraguard = [
+    "data/*.json",
     "web/*",
     "_vendor/MANIFEST.json",
     "_vendor/*/LICENSE",

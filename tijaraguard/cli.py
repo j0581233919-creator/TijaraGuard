@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import signal
 import sys
@@ -14,10 +15,11 @@ sys.dont_write_bytecode = True
 from .api import TijaraGuardHTTPServer
 from .config import load_config, validate_config
 from .demo import run_demo
-from .deps import inspect_dependencies
+from .deps import DependencyLoadError, inspect_dependencies
 from .ledger import restore_ledger_backup, verify_audit_database_readonly
-from .models import ApprovalToken, InboundMessage
+from .models import ApprovalToken, InboundMessage, TijaraGuardError
 from .runtime import build_pipeline_from_config
+from .security import scrub_secrets_from_text
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -136,9 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-
+def _dispatch_command(args: argparse.Namespace) -> int:
     if args.command == "inspect-deps":
         print(json.dumps(inspect_dependencies(), ensure_ascii=False, indent=2))
         return 0
@@ -191,11 +191,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if report["valid"] else 1
 
     if args.command == "serve":
+        cfg = dataclasses.replace(
+            cfg,
+            bind_host=args.host or cfg.bind_host,
+            bind_port=cfg.bind_port if args.port is None else args.port,
+        )
         report = validate_config(cfg)
         if not report["valid"]:
             print(json.dumps(report, ensure_ascii=False, indent=2), file=sys.stderr)
             return 1
-        server = TijaraGuardHTTPServer(cfg, host=args.host, port=args.port).start()
+        server = TijaraGuardHTTPServer(cfg).start()
         print(
             json.dumps(
                 {
@@ -307,7 +312,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "dispatch":
         active = pipe.ledger.get_active_approval(args.draft_id)
         if active is None:
-            print(json.dumps({"error": f"No active approval lease for {args.draft_id}"}))
+            print(json.dumps({"error": f"No active approval lease for {args.draft_id}"}), file=sys.stderr)
             return 1
         token = ApprovalToken(
             lease_id=active["lease_id"],
@@ -352,3 +357,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     return 2
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return _dispatch_command(args)
+    except (TijaraGuardError, DependencyLoadError, OSError) as exc:
+        print(
+            json.dumps(
+                {
+                    "error": type(exc).__name__,
+                    "detail": scrub_secrets_from_text(str(exc)),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1

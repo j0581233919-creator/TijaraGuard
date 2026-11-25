@@ -200,11 +200,29 @@ class TestPersistenceAndMigrations(unittest.TestCase):
         with self.assertRaises(MalformedInputError):
             restore_ledger_backup(bad_bak, restored_db)
 
-        # Retention purge scrubs expired terminal draft but preserves pending draft & audit chain
+        # Retention purge scrubs expired terminal draft & body while preserving pending draft & audit chain
+        r_blk = pipe.process_inbound(
+            make_inbound_message(
+                message_id="msg-ret-blocked",
+                consent_to_contact=False,
+                consent_evidence="",
+                requested_sku="DELONGHI-EC685",
+                raw_text="استفسار مرفوض بدون موافقة",
+            )
+        )
+        self.assertEqual(r_blk["state"], DraftState.VERIFIED_BLOCKED.value)
         purge_res = pipe.ledger.purge_expired_retention(now_iso="2099-01-01T00:00:00+00:00")
-        self.assertEqual(purge_res["purged_drafts"], 1)
+        self.assertEqual(purge_res["purged_drafts"], 2)
         self.assertEqual(
             pipe.ledger.get_draft(r_shadow["draft_id"])["redacted_inquiry"],
+            "[PURGED_BY_RETENTION]",
+        )
+        self.assertEqual(
+            pipe.ledger.get_draft(r_shadow["draft_id"])["body"],
+            "[PURGED_BY_RETENTION]",
+        )
+        self.assertEqual(
+            pipe.ledger.get_draft(r_blk["draft_id"])["redacted_inquiry"],
             "[PURGED_BY_RETENTION]",
         )
         self.assertEqual(
@@ -213,6 +231,25 @@ class TestPersistenceAndMigrations(unittest.TestCase):
         )
         chain_ok, chain_errs = pipe.ledger.verify_audit_chain()
         self.assertTrue(chain_ok, chain_errs)
+
+        # Audit trigger WHERE 0 bypass must be detected by verify_audit_database_readonly
+        bad_trig_db = self.tmpdir / "bad_where_trig.sqlite3"
+        shutil.copy2(db_path, bad_trig_db)
+        wconn = sqlite3.connect(str(bad_trig_db))
+        wconn.execute("DROP TRIGGER audit_events_no_update")
+        wconn.execute(
+            "CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events "
+            "BEGIN SELECT RAISE(ABORT, 'x') WHERE 0; END;"
+        )
+        wconn.commit()
+        wconn.close()
+        ok_wt, _cnt, errs_wt = verify_audit_database_readonly(bad_trig_db)
+        self.assertFalse(ok_wt)
+        self.assertTrue(any("trigger" in e.lower() for e in errs_wt))
+
+        # Tenant filtering in list_audit_events isolates non-default tenants
+        self.assertEqual(pipe.ledger.list_audit_events(draft_id=r_shadow["draft_id"], tenant_id="other_tenant"), [])
+        self.assertTrue(len(pipe.ledger.list_audit_events(draft_id=r_shadow["draft_id"], tenant_id="default")) >= 2)
 
     def test_ephemeral_route_store_isolation(self) -> None:
         routes = EphemeralRouteStore(self.tmpdir / "routes.sqlite3", default_ttl_seconds=60)

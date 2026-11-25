@@ -16,7 +16,25 @@ from .models import ApprovalTamperError, ExecutionMode, InboundMessage
 from .pipeline import TijaraGuardPipeline
 
 
-_SYNTHETIC_CATALOG_PATH = Path(__file__).resolve().parents[1] / "examples" / "catalog.json"
+def _resolve_demo_catalog() -> Path:
+    pkg_dir = Path(__file__).resolve().parent
+    repo_cat = pkg_dir.parent / "examples" / "catalog.json"
+    if repo_cat.is_file():
+        return repo_cat
+    cwd_cat = Path.cwd() / "examples" / "catalog.json"
+    if cwd_cat.is_file():
+        return cwd_cat
+    return pkg_dir / "data" / "catalog.json"
+
+
+def _resolve_demo_state_root() -> Path:
+    pkg_parent = Path(__file__).resolve().parents[1]
+    if (pkg_parent / "pyproject.toml").is_file() or (pkg_parent / "examples").is_dir():
+        return pkg_parent
+    return Path.cwd()
+
+
+_SYNTHETIC_CATALOG_PATH = _resolve_demo_catalog()
 
 # Checksum-valid synthetic test PII (from BayanGate synthetic benchmark vectors).
 _SYNTHETIC_SAUDI_ID = "1082345677"
@@ -33,7 +51,7 @@ _RAW_PII_SECRETS: List[str] = [
 
 def run_demo(state_dir: str | Path | None = None) -> Dict[str, Any]:
     """Executes all 4 gates across positive and adversarial paths and prints verification proof."""
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = _resolve_demo_state_root()
     base_dir = (
         Path(state_dir).resolve()
         if state_dir is not None

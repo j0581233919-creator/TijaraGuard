@@ -94,8 +94,12 @@ class TestAPIAndCLI(unittest.TestCase):
                 self.assertEqual(st_h, 200)
                 self.assertIn("TijaraGuard Operator Console", html)
                 self.assertNotIn("op-secret-key-2026", html)
+                self.assertNotIn("onclick=", html)
+                st_js, _, js_code = self._http(srv.base_url, "GET", "/app.js")
+                self.assertEqual(st_js, 200)
+                self.assertIn("issuedLeases", js_code)
 
-                # 2. Protected /api/v1/* fails closed without valid Bearer/X-API-Key
+                # 2. Protected /api/v1/* fails closed without valid Bearer/X-API-Key (even on invalid JSON)
                 st_u, _, _ = self._http(srv.base_url, "GET", "/api/v1/status")
                 self.assertEqual(st_u, 401)
                 st_b, _, _ = self._http(
@@ -105,8 +109,28 @@ class TestAPIAndCLI(unittest.TestCase):
                     headers={"Authorization": "Bearer wrong"},
                 )
                 self.assertEqual(st_b, 401)
+                parsed_srv = urlsplit(srv.base_url)
+                bad_conn = http.client.HTTPConnection(parsed_srv.hostname, parsed_srv.port, timeout=5.0)
+                bad_conn.request(
+                    "POST",
+                    "/api/v1/inquiries",
+                    body=b"{not-json",
+                    headers={"Content-Type": "application/json", "Content-Length": "9"},
+                )
+                self.assertEqual(bad_conn.getresponse().status, 401)
+                bad_conn.close()
 
                 auth = {"Authorization": "Bearer op-secret-key-2026"}
+
+                # Malformed query/body integers return 400 (never 500)
+                self.assertEqual(
+                    self._http(srv.base_url, "GET", "/api/v1/drafts?limit=abc", headers=auth)[0],
+                    400,
+                )
+                self.assertEqual(
+                    self._http(srv.base_url, "GET", "/api/v1/drafts?limit=", headers=auth)[0],
+                    400,
+                )
 
                 # 3. Catalog search, inquiry ingestion, edit, approve, dispatch (lost ACK -> UNKNOWN), recover
                 st_cs, _, cs_raw = self._http(
@@ -139,7 +163,42 @@ class TestAPIAndCLI(unittest.TestCase):
                 draft = json.loads(in_raw)
                 self.assertNotIn(SYNTH_SAUDI_ID, draft["redacted_inquiry"])
 
-                # Approve -> Dispatch -> Recover
+                # Duplicate message_id returns 409 Conflict cleanly (not 500)
+                st_dup_id, _, _ = self._http(
+                    srv.base_url,
+                    "POST",
+                    "/api/v1/inquiries",
+                    headers=auth,
+                    body={
+                        "message_id": "msg-api-1",
+                        "conversation_id": "conv-api-1",
+                        "customer_handle": "عميل_واجهة",
+                        "raw_contact_target": "+966501234567",
+                        "contact_channel": "whatsapp",
+                        "consent_to_contact": True,
+                        "consent_evidence": "api_opt_in",
+                        "preferred_language": "ar",
+                        "raw_text": "كم سعر ماكينة قهوة ديلونجي EC685؟",
+                    },
+                )
+                self.assertEqual(st_dup_id, 409)
+
+                # Invalid ttl_seconds (0, true, abc) return 400 (never 500)
+                for bad_ttl in (0, True, "abc"):
+                    st_bt, _, _ = self._http(
+                        srv.base_url,
+                        "POST",
+                        f"/api/v1/drafts/{draft['draft_id']}/approve",
+                        headers=auth,
+                        body={
+                            "reviewer_id": "op_ahmed",
+                            "expected_payload_sha256": draft["payload_sha256"],
+                            "ttl_seconds": bad_ttl,
+                        },
+                    )
+                    self.assertEqual(st_bt, 400)
+
+                # Approve -> empty {} dispatch rejected (409) -> explicit lease+mac+sha dispatch -> Recover
                 st_ap, _, ap_raw = self._http(
                     srv.base_url,
                     "POST",
@@ -151,13 +210,29 @@ class TestAPIAndCLI(unittest.TestCase):
                     },
                 )
                 self.assertEqual(st_ap, 200)
+                lease = json.loads(ap_raw)
 
-                st_dp, _, dp_raw = self._http(
+                st_dp_empty, _, _ = self._http(
                     srv.base_url,
                     "POST",
                     f"/api/v1/drafts/{draft['draft_id']}/dispatch",
                     headers=auth,
                     body={},
+                )
+                self.assertEqual(st_dp_empty, 409)
+
+                # Bad confirm_delivered="false" string is rejected or parsed strictly (not coerced to True)
+                st_dp, _, dp_raw = self._http(
+                    srv.base_url,
+                    "POST",
+                    f"/api/v1/drafts/{draft['draft_id']}/dispatch",
+                    headers=auth,
+                    body={
+                        "lease_id": lease["lease_id"],
+                        "approval_mac": lease["approval_mac"],
+                        "payload_sha256": lease["payload_sha256"],
+                        "confirm_delivered": "false",
+                    },
                 )
                 self.assertEqual(st_dp, 200)
                 self.assertEqual(json.loads(dp_raw)["state"], "UNKNOWN_DELIVERY")
@@ -167,10 +242,21 @@ class TestAPIAndCLI(unittest.TestCase):
                     "POST",
                     f"/api/v1/drafts/{draft['draft_id']}/recover",
                     headers=auth,
-                    body={},
+                    body={"confirm_delivered": "false"},
                 )
                 self.assertEqual(st_rc, 200)
-                self.assertEqual(json.loads(rc_raw)["state"], "DELIVERED")
+                # confirm_delivered="false" stops at ACCEPTED_DELIVERY instead of prematurely DELIVERED
+                self.assertEqual(json.loads(rc_raw)["state"], "ACCEPTED_DELIVERY")
+
+                st_rc2, _, rc_raw2 = self._http(
+                    srv.base_url,
+                    "POST",
+                    f"/api/v1/drafts/{draft['draft_id']}/recover",
+                    headers=auth,
+                    body={"confirm_delivered": True},
+                )
+                self.assertEqual(st_rc2, 200)
+                self.assertEqual(json.loads(rc_raw2)["state"], "DELIVERED")
 
                 # 4. CSV export & maintenance backup/purge & conversations & usage
                 st_csv, _, csv_text = self._http(srv.base_url, "GET", "/api/v1/audit/export.csv", headers=auth)
@@ -216,7 +302,10 @@ class TestAPIAndCLI(unittest.TestCase):
                     },
                 )
                 wh_resp = c.getresponse()
+                wh_resp_body = json.loads(wh_resp.read().decode("utf-8"))
                 self.assertEqual(wh_resp.status, 200)
+                self.assertNotIn("ingested", wh_resp_body)
+                self.assertEqual(wh_resp_body["ingested_count"], 1)
                 c.close()
 
         # 6. Rate limiting returns HTTP 429 with Retry-After header
@@ -329,3 +418,25 @@ class TestAPIAndCLI(unittest.TestCase):
             check=True,
         )
         self.assertTrue(bak_file.is_file())
+
+        # serve --host 0.0.0.0 without TIJARAGUARD_API_KEY must fail validation (exit 1)
+        p_srv_bad = subprocess.run(
+            [sys.executable, "-B", "-m", "tijaraguard", "serve", "--host", "0.0.0.0"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p_srv_bad.returncode, 1)
+        self.assertIn("TIJARAGUARD_API_KEY", p_srv_bad.stderr)
+
+        # CLI errors emit structured JSON on stderr instead of raw traceback
+        p_err = subprocess.run(
+            [sys.executable, "-B", "-m", "tijaraguard", "approve", "DRAFT-MISSING", "--reviewer", "sup", "--payload-sha256", "a" * 64],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p_err.returncode, 1)
+        self.assertIn("MalformedInputError", json.loads(p_err.stderr)["error"])

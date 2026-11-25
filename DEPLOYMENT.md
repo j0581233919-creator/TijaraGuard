@@ -54,4 +54,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard restore /path/to/backup.sqli
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard purge-retention
 ```
-Redacts expired `redacted_inquiry` and `consent_evidence` fields on terminal drafts (`DELIVERED`, `REJECTED`, `SHADOW_RECORDED`, `FAILED_DELIVERY`) and prunes old channel replay keys while leaving pending/approved drafts and `audit_events` untouched.
+Redacts expired `redacted_inquiry`, `body`, and `consent_evidence` fields on expired non-active drafts (`DELIVERED`, `REJECTED`, `SHADOW_RECORDED`, `FAILED_DELIVERY`, `VERIFIED_BLOCKED`, `ESCALATED`) and prunes old channel replay keys while leaving pending/approved drafts and `audit_events` untouched. Note: because `consent_evidence` and `body` are scrubbed to `[PURGED_BY_RETENTION]`, recomputing `compute_draft_payload_sha256()` on purged terminal rows will no longer match the historical `payload_sha256` (terminal rows cannot be re-approved or dispatched).

@@ -49,6 +49,10 @@ class TestSecurityAndConfig(unittest.TestCase):
             "https://169.254.169.254/latest/meta-data/",
             "https://10.0.0.1/internal",
             "https://192.168.1.10/admin",
+            "https://100.64.0.1/cgnat",
+            "https://100.100.100.200/metadata",
+            "https://[::ffff:127.0.0.1]/loopback",
+            "https://[2002:7f00:0001::]/6to4",
             "https://127.0.0.1:8080/secret",
             "http://api.openai.com/v1",
             "https://user:pass@api.openai.com/v1",
@@ -59,6 +63,14 @@ class TestSecurityAndConfig(unittest.TestCase):
         for bad_url in blocked_urls:
             with self.assertRaises(SSRFError, msg=f"Expected SSRFError for {bad_url}"):
                 validate_outbound_url(bad_url)
+
+        # require_dns=True must fail closed on unresolvable/non-existent hostname
+        with self.assertRaises(SSRFError):
+            validate_outbound_url("https://nonexistent.invalid.tijaraguard.test/v1", require_dns=True)
+
+        # Hostname localhost still blocked even when allow_loopback=True
+        with self.assertRaises(SSRFError):
+            validate_outbound_url("http://localhost:11434", allow_loopback=True, allow_http_loopback=True)
 
         self.assertEqual(
             validate_outbound_url("https://api.openai.com/v1/"),
@@ -107,37 +119,46 @@ class TestSecurityAndConfig(unittest.TestCase):
         self.assertEqual(sanitize_csv_cell("=CMD('calc')"), "'=CMD('calc')")
         self.assertEqual(sanitize_csv_cell("+1+1"), "'+1+1")
         self.assertEqual(sanitize_csv_cell(" -2"), "' -2")
+        self.assertEqual(sanitize_csv_cell("\n=1+1"), "'\n=1+1")
         self.assertEqual(sanitize_csv_cell("@SUM(A1)"), "'@SUM(A1)")
         self.assertEqual(sanitize_csv_cell("normal_id"), "normal_id")
 
         raw = (
             "POST https://api.telegram.org/bot123456:AAFakeBotSecretToken123/sendMessage "
-            "Authorization: Bearer sk-testsecret1234567890 AIzaFakeGeminiKey1234567890"
+            "Authorization: Bearer sk-testsecret1234567890 AIzaFakeGeminiKey1234567890 "
+            "x-goog-api-key: GeminiSecretHeaderVal"
         )
         cleaned = scrub_secrets_from_text(raw, ("explicit-secret-xyz",))
         self.assertNotIn("AAFakeBotSecretToken123", cleaned)
         self.assertNotIn("sk-testsecret1234567890", cleaned)
         self.assertNotIn("AIzaFakeGeminiKey1234567890", cleaned)
+        self.assertNotIn("GeminiSecretHeaderVal", cleaned)
 
         gate = PrivacyGate(contact_hash_key=make_secret_bytes())
         flt = SecretAndPIIRedactingLogFilter(
             privacy_gate=gate,
             secrets_provider=lambda: ["super-secret-value-99"],
         )
-        record = logging.LogRecord(
-            name="tijaraguard.test",
-            level=logging.INFO,
-            pathname=__file__,
-            lineno=1,
-            msg="secret=%s id=%s iban=%s",
-            args=("super-secret-value-99", SYNTH_SAUDI_ID, SYNTH_GCC_IBAN),
-            exc_info=None,
-        )
+        try:
+            raise RuntimeError(f"boom {SYNTH_SAUDI_ID} super-secret-value-99")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+            record = logging.LogRecord(
+                name="tijaraguard.pipeline",
+                level=logging.ERROR,
+                pathname=__file__,
+                lineno=1,
+                msg="secret=%s id=%s iban=%s",
+                args=("super-secret-value-99", SYNTH_SAUDI_ID, SYNTH_GCC_IBAN),
+                exc_info=exc_info,
+            )
         flt.filter(record)
         msg = record.getMessage()
         self.assertNotIn("super-secret-value-99", msg)
         self.assertNotIn(SYNTH_SAUDI_ID, msg)
         self.assertNotIn(SYNTH_GCC_IBAN, msg)
+        self.assertNotIn("super-secret-value-99", record.exc_text or "")
+        self.assertNotIn(SYNTH_SAUDI_ID, record.exc_text or "")
 
     def test_config_validation_rejects_live_ephemeral_secrets_and_unauthenticated_nonloopback(self) -> None:
         env_bad = {
@@ -171,3 +192,28 @@ class TestSecurityAndConfig(unittest.TestCase):
         self.assertNotIn("operator-secret-key-2026", pub_str)
         self.assertNotIn("sk-test-1234567890", pub_str)
         self.assertNotIn("a" * 64, pub_str)
+
+        # .env.example must NOT auto-enable Ollama
+        env_ex: dict[str, str] = {}
+        for line in (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if v.strip():
+                env_ex[k.strip()] = v.strip()
+        env_ex["TIJARAGUARD_CATALOG_PATH"] = str(CATALOG_PATH)
+        cfg_ex = load_config(env=env_ex)
+        self.assertNotIn("ollama", cfg_ex.providers)
+
+        # receipt_lookup_url SSRF rejected
+        cfg_wh_bad = load_config(
+            env={
+                "TIJARAGUARD_CATALOG_PATH": str(CATALOG_PATH),
+                "TIJARAGUARD_WEBHOOK_ENABLED": "true",
+                "TIJARAGUARD_WEBHOOK_LOOKUP_URL": "http://169.254.169.254/latest",
+            }
+        )
+        rep_wh_bad = validate_config(cfg_wh_bad)
+        self.assertFalse(rep_wh_bad["valid"])
+        self.assertTrue(any("receipt_lookup_url" in e for e in rep_wh_bad["errors"]))

@@ -15,12 +15,11 @@ from .channels.base import (
     normalize_receipt_id,
 )
 from .commerce import CommercialGate
-from .delivery import MessageShieldDeliveryAdapter
+from .delivery import _OUTBOX_INIT_LOCK, MessageShieldDeliveryAdapter
 from .ledger import ApprovalLedger, EphemeralRouteStore
 from .models import (
     ApprovalRequiredError,
     ApprovalToken,
-    ChannelError,
     CommercialEvaluation,
     DeliveryError,
     DispatchOutcome,
@@ -29,6 +28,7 @@ from .models import (
     InboundMessage,
     MalformedInputError,
     PrivacyViolationError,
+    ProviderError,
     canonical_json,
     sha256_hex,
     validate_safe_id,
@@ -38,6 +38,8 @@ from .providers.base import TaskComplexity
 from .providers.router import ModelRouter
 
 logger = logging.getLogger("tijaraguard.pipeline")
+
+_CHATWOOT_CONV_ID_RE = re.compile(r"^[0-9]{1,20}$")
 
 
 def _safe_message_id(channel: str, external_event_id: str) -> str:
@@ -94,11 +96,8 @@ class TijaraGuardPipeline:
             approval_secret=approval_secret,
         )
         self.ai_router = ai_router
-        if self.ai_router is not None:
-            if self.ai_router.privacy_gate is None:
-                self.ai_router.privacy_gate = self.privacy_gate
-            if self.ai_router.on_attempt is None:
-                self.ai_router.on_attempt = self._record_ai_attempt
+        if self.ai_router is not None and self.ai_router.privacy_gate is None:
+            self.ai_router.privacy_gate = self.privacy_gate
 
         self.channel_registry = channel_registry or ChannelRegistry()
         self.route_store = route_store
@@ -117,27 +116,46 @@ class TijaraGuardPipeline:
                 endpoint_url=receiver_endpoint,
                 timeout=self.shield_timeout,
             )
-        elif mode == ExecutionMode.LIVE and self.outbox_db_path is None:
-            raise MalformedInputError("LIVE mode requires outbox_db_path.")
+        elif mode == ExecutionMode.LIVE:
+            if self.outbox_db_path is None:
+                raise MalformedInputError("LIVE mode requires outbox_db_path.")
+            self._ensure_live_outbox_initialized()
 
-        self._last_ai_draft_id: Optional[str] = None
+    def _ensure_live_outbox_initialized(self) -> None:
+        from message_shield.store import Store  # type: ignore[import-not-found]
 
-    def _record_ai_attempt(self, attempt: Dict[str, Any]) -> None:
-        self.ledger.record_provider_usage(
-            draft_id=self._last_ai_draft_id,
-            tenant_id=self.tenant_id,
-            provider=str(attempt.get("provider") or "unknown"),
-            model=str(attempt.get("model") or "unknown"),
-            task_tier=str(attempt.get("task_tier") or "standard"),
-            status=str(attempt.get("status") or "ERROR"),
-            error_category=attempt.get("error_category"),
-            latency_ms=float(attempt.get("latency_ms") or 0.0),
-            prompt_tokens=attempt.get("prompt_tokens"),
-            completion_tokens=attempt.get("completion_tokens"),
-            total_tokens=attempt.get("total_tokens"),
-            estimated_cost_usd=attempt.get("estimated_cost_usd"),
-            fallback_from=attempt.get("fallback_from"),
-        )
+        assert self.outbox_db_path is not None
+        self.outbox_db_path.parent.mkdir(parents=True, exist_ok=True)
+        with _OUTBOX_INIT_LOCK:
+            if not self.outbox_db_path.exists():
+                try:
+                    Store(self.outbox_db_path, create=True)
+                except FileExistsError:
+                    Store(self.outbox_db_path, create=False)
+
+    def _persist_ai_attempts(
+        self,
+        attempts: List[Dict[str, Any]],
+        *,
+        draft_id: Optional[str],
+        tenant_id: str,
+    ) -> None:
+        for attempt in attempts:
+            self.ledger.record_provider_usage(
+                draft_id=draft_id,
+                tenant_id=tenant_id,
+                provider=str(attempt.get("provider") or "unknown"),
+                model=str(attempt.get("model") or "unknown"),
+                task_tier=str(attempt.get("task_tier") or "standard"),
+                status=str(attempt.get("status") or "ERROR"),
+                error_category=attempt.get("error_category"),
+                latency_ms=float(attempt.get("latency_ms") or 0.0),
+                prompt_tokens=attempt.get("prompt_tokens"),
+                completion_tokens=attempt.get("completion_tokens"),
+                total_tokens=attempt.get("total_tokens"),
+                estimated_cost_usd=attempt.get("estimated_cost_usd"),
+                fallback_from=attempt.get("fallback_from"),
+            )
 
     def _assert_evaluation_pii_clean(self, evaluation: CommercialEvaluation) -> None:
         if evaluation.sku:
@@ -159,6 +177,16 @@ class TijaraGuardPipeline:
                     f"Gate 2 evaluation retained PII in '{field_name}': {leaked}"
                 )
 
+    def _assert_operator_id_clean(self, identifier: str, field_name: str) -> str:
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise MalformedInputError(f"{field_name} must be a non-empty string.")
+        clean = identifier.strip()
+        if self.privacy_gate.verify_identifier_clean(clean):
+            raise PrivacyViolationError(
+                f"Supported PII detected in '{field_name}'; rejected before persistence."
+            )
+        return clean
+
     def process_inbound(
         self,
         msg: InboundMessage,
@@ -175,14 +203,25 @@ class TijaraGuardPipeline:
             envelope.pii_summary.get("entity_count", 0),
         )
 
-        self._last_ai_draft_id = None
-        evaluation = self.commercial_gate.evaluate_and_draft(
-            envelope,
-            custom_llm_callable=custom_llm_callable,
-            ai_router=self.ai_router,
-            task_complexity=task_complexity,
-            fallback_to_template_on_ai_error=self.fallback_to_template_on_ai_error,
-        )
+        attempts_buf: List[Dict[str, Any]] = []
+        try:
+            evaluation = self.commercial_gate.evaluate_and_draft(
+                envelope,
+                custom_llm_callable=custom_llm_callable,
+                ai_router=self.ai_router,
+                task_complexity=task_complexity,
+                fallback_to_template_on_ai_error=self.fallback_to_template_on_ai_error,
+                on_ai_attempt=attempts_buf.append,
+            )
+        except BaseException:
+            if attempts_buf:
+                self._persist_ai_attempts(
+                    attempts_buf,
+                    draft_id=None,
+                    tenant_id=envelope.tenant_id,
+                )
+            raise
+
         self._assert_evaluation_pii_clean(evaluation)
         logger.info(
             "gate2_verified draft_id=%s sku=%s status=%s provider=%s",
@@ -197,6 +236,13 @@ class TijaraGuardPipeline:
             evaluation,
             retention_days=self.retention_days,
         )
+        if attempts_buf:
+            self._persist_ai_attempts(
+                attempts_buf,
+                draft_id=draft_row["draft_id"],
+                tenant_id=draft_row["tenant_id"],
+            )
+
         return {
             "draft_id": draft_row["draft_id"],
             "tenant_id": draft_row["tenant_id"],
@@ -227,22 +273,16 @@ class TijaraGuardPipeline:
         post_chatwoot_private_note: bool = False,
         custom_llm_callable: Optional[Callable[[str, Dict[str, Any]], str]] = None,
     ) -> Dict[str, Any]:
-        """Deduplicates and ingests an authenticated inbound channel event."""
+        """Validates PII, deduplicates, and ingests an authenticated inbound channel event."""
         tenant = validate_safe_id(event.tenant_id or self.tenant_id, "tenant_id")
-        is_new = self.ledger.register_channel_event(
-            event.channel,
-            event.external_event_id,
-            tenant_id=tenant,
-            conversation_id=event.conversation_id,
-            status="PROCESSING",
-        )
-        if not is_new:
-            return {
-                "duplicate": True,
-                "channel": event.channel,
-                "external_event_id": event.external_event_id,
-                "conversation_id": event.conversation_id,
-            }
+        if self.privacy_gate.verify_identifier_clean(event.external_event_id):
+            raise PrivacyViolationError(
+                "Supported PII detected in channel external_event_id; rejected before persistence."
+            )
+        if self.privacy_gate.verify_identifier_clean(event.conversation_id):
+            raise PrivacyViolationError(
+                "Supported PII detected in channel conversation_id; rejected before persistence."
+            )
 
         msg = InboundMessage(
             message_id=_safe_message_id(event.channel, event.external_event_id),
@@ -258,7 +298,45 @@ class TijaraGuardPipeline:
             tenant_id=tenant,
             channel_metadata=dict(event.metadata or {}),
         )
-        result = self.process_inbound(msg, custom_llm_callable=custom_llm_callable)
+        # Verify Gate 1 identifier safety before registering channel_events in ledger DB
+        for id_val in (msg.message_id, msg.conversation_id, msg.tenant_id, msg.requested_sku or ""):
+            if id_val and self.privacy_gate.verify_identifier_clean(id_val):
+                raise PrivacyViolationError(
+                    "Supported PII detected in identifier field; rejected before persistence."
+                )
+
+        is_new = self.ledger.register_channel_event(
+            event.channel,
+            event.external_event_id,
+            tenant_id=tenant,
+            conversation_id=event.conversation_id,
+            status="PROCESSING",
+        )
+        if not is_new:
+            return {
+                "duplicate": True,
+                "channel": event.channel,
+                "external_event_id": event.external_event_id,
+                "conversation_id": event.conversation_id,
+            }
+
+        try:
+            result = self.process_inbound(msg, custom_llm_callable=custom_llm_callable)
+        except ProviderError:
+            self.ledger.release_channel_event(
+                event.channel,
+                event.external_event_id,
+                tenant_id=tenant,
+            )
+            raise
+        except BaseException:
+            self.ledger.release_channel_event(
+                event.channel,
+                event.external_event_id,
+                tenant_id=tenant,
+            )
+            raise
+
         self.ledger.update_channel_event(
             event.channel,
             event.external_event_id,
@@ -293,27 +371,52 @@ class TijaraGuardPipeline:
                         ),
                     )
                 except Exception as exc:
-                    logger.warning("chatwoot_private_note_failed draft_id=%s err=%s", result["draft_id"], type(exc).__name__)
+                    logger.warning(
+                        "chatwoot_private_note_failed draft_id=%s err=%s",
+                        result["draft_id"],
+                        type(exc).__name__,
+                    )
 
         return {"duplicate": False, **result}
 
     def process_status_event(self, status_event: ChannelStatusEvent) -> Dict[str, Any]:
-        """Reconciles inbound delivery status callbacks (e.g. WhatsApp delivered/read)."""
+        """Reconciles inbound delivery status callbacks (delivered, read, failed)."""
+        is_new = self.ledger.register_channel_event(
+            f"{status_event.channel}_status",
+            status_event.external_event_id,
+            tenant_id=self.tenant_id,
+            status="STATUS_RECEIVED",
+        )
+        if not is_new:
+            return {
+                "duplicate": True,
+                "matched": False,
+                "status": status_event.status,
+            }
+
         norm_receipt = normalize_receipt_id(
             status_event.channel, status_event.external_message_id
         )
-        matched_draft = None
-        for d in self.ledger.list_drafts(limit=200):
-            if d.get("receipt_id") == norm_receipt:
-                matched_draft = d
-                break
-
+        matched_draft = self.ledger.get_draft_by_receipt_id(
+            norm_receipt,
+            tenant_id=self.tenant_id,
+            channel=status_event.channel,
+        )
         if matched_draft is None:
             return {"matched": False, "receipt_id": norm_receipt, "status": status_event.status}
 
         draft_id = matched_draft["draft_id"]
+        current_state = matched_draft["state"]
+        self.ledger.update_channel_event(
+            f"{status_event.channel}_status",
+            status_event.external_event_id,
+            status="STATUS_APPLIED",
+            draft_id=draft_id,
+            tenant_id=self.tenant_id,
+        )
+
         if status_event.status in ("delivered", "read"):
-            if matched_draft["state"] == DraftState.ACCEPTED_DELIVERY.value:
+            if current_state == DraftState.ACCEPTED_DELIVERY.value:
                 if self.outbox_db_path is not None and self.channel_registry.has(
                     matched_draft["contact_channel"]
                 ):
@@ -327,16 +430,29 @@ class TijaraGuardPipeline:
                         ms_adapter.confirm_delivered(draft_id, norm_receipt)
                     except DeliveryError:
                         pass
-                self.ledger.record_delivery_state(
+                updated = self.ledger.record_delivery_state(
                     draft_id,
                     DraftState.DELIVERED,
                     receipt_id=norm_receipt,
                     details={"status_callback": status_event.status},
                     actor=f"webhook_{status_event.channel}",
                 )
-            return {"matched": True, "draft_id": draft_id, "state": DraftState.DELIVERED.value}
+                return {"matched": True, "draft_id": draft_id, "state": updated["state"]}
+            return {"matched": True, "draft_id": draft_id, "state": current_state}
 
-        return {"matched": True, "draft_id": draft_id, "state": matched_draft["state"]}
+        if status_event.status == "failed":
+            if current_state == DraftState.ACCEPTED_DELIVERY.value:
+                updated = self.ledger.record_delivery_state(
+                    draft_id,
+                    DraftState.FAILED_DELIVERY,
+                    receipt_id=norm_receipt,
+                    details={"status_callback": "failed", "error": status_event.error},
+                    actor=f"webhook_{status_event.channel}",
+                )
+                return {"matched": True, "draft_id": draft_id, "state": updated["state"]}
+            return {"matched": True, "draft_id": draft_id, "state": current_state}
+
+        return {"matched": True, "draft_id": draft_id, "state": current_state}
 
     def approve(
         self,
@@ -348,12 +464,13 @@ class TijaraGuardPipeline:
         ttl_seconds: int = 900,
     ) -> ApprovalToken:
         """Issues a cryptographic single-use human approval lease for a verified draft."""
+        clean_reviewer = self._assert_operator_id_clean(reviewer_id, "reviewer_id")
         if not isinstance(notes, str):
             raise MalformedInputError("notes must be a string.")
         safe_notes = self.privacy_gate.redact_text_full(notes)
         token = self.ledger.approve_draft(
             draft_id=draft_id,
-            reviewer_id=reviewer_id,
+            reviewer_id=clean_reviewer,
             expected_payload_sha256=expected_payload_sha256,
             notes=safe_notes,
             ttl_seconds=ttl_seconds,
@@ -368,19 +485,21 @@ class TijaraGuardPipeline:
 
     def reject(self, draft_id: str, *, reviewer_id: str, reason: str) -> Dict[str, Any]:
         """Rejects a pending or approved draft and revokes any active lease."""
+        clean_reviewer = self._assert_operator_id_clean(reviewer_id, "reviewer_id")
         if not isinstance(reason, str):
             raise MalformedInputError("reason must be a string.")
         safe_reason = self.privacy_gate.redact_text_full(reason)
-        row = self.ledger.reject_draft(draft_id, reviewer_id=reviewer_id, reason=safe_reason)
-        logger.info("gate3_rejected draft_id=%s reviewer=%s", draft_id, reviewer_id)
+        row = self.ledger.reject_draft(draft_id, reviewer_id=clean_reviewer, reason=safe_reason)
+        logger.info("gate3_rejected draft_id=%s reviewer=%s", draft_id, clean_reviewer)
         return row
 
     def escalate(self, draft_id: str, *, actor: str, reason: str) -> Dict[str, Any]:
         """Escalates a draft to human operator handoff and notifies Chatwoot if applicable."""
+        clean_actor = self._assert_operator_id_clean(actor, "actor")
         if not isinstance(reason, str):
             raise MalformedInputError("reason must be a string.")
         safe_reason = self.privacy_gate.redact_text_full(reason)
-        row = self.ledger.escalate_draft(draft_id, actor=actor, reason=safe_reason)
+        row = self.ledger.escalate_draft(draft_id, actor=clean_actor, reason=safe_reason)
         if row["contact_channel"] == "chatwoot" and self.channel_registry.has("chatwoot"):
             adapter = self.channel_registry.get("chatwoot")
             if self.route_store is not None and hasattr(adapter, "handoff_to_human"):
@@ -388,24 +507,30 @@ class TijaraGuardPipeline:
                     tenant_id=row["tenant_id"],
                     channel="chatwoot",
                     contact_ref=row["contact_ref"],
+                    external_conversation_id=row["conversation_id"],
                 )
                 if route:
                     try:
                         adapter.handoff_to_human(route["external_target"], safe_reason)  # type: ignore[attr-defined]
                     except Exception as exc:
-                        logger.warning("chatwoot_handoff_failed draft_id=%s err=%s", draft_id, type(exc).__name__)
-        logger.info("gate3_escalated draft_id=%s actor=%s", draft_id, actor)
+                        logger.warning(
+                            "chatwoot_handoff_failed draft_id=%s err=%s",
+                            draft_id,
+                            type(exc).__name__,
+                        )
+        logger.info("gate3_escalated draft_id=%s actor=%s", draft_id, clean_actor)
         return row
 
     def edit_draft(self, draft_id: str, *, new_body: str, actor: str) -> Dict[str, Any]:
         """Re-verifies an edited draft body and invalidates any previously issued approval."""
+        clean_actor = self._assert_operator_id_clean(actor, "actor")
         draft_row = self.ledger.get_draft(draft_id)
         evaluation = self.commercial_gate.verify_edited_body(
             draft_row=draft_row,
             new_body=new_body,
         )
         self._assert_evaluation_pii_clean(evaluation)
-        updated = self.ledger.edit_draft_body(draft_id, evaluation, actor=actor)
+        updated = self.ledger.edit_draft_body(draft_id, evaluation, actor=clean_actor)
         logger.info(
             "gate3_edited draft_id=%s new_state=%s verification=%s",
             draft_id,
@@ -420,6 +545,7 @@ class TijaraGuardPipeline:
         adapter: Any,
         target: str,
         conversation_id: Optional[str],
+        tenant: Optional[str] = None,
     ) -> MessageShieldDeliveryAdapter:
         assert self.outbox_db_path is not None
         transport = ChannelShieldTransport(
@@ -427,9 +553,11 @@ class TijaraGuardPipeline:
             target=target,
             conversation_id=conversation_id,
         )
+        ms_tenant = tenant or self.tenant_id
         return MessageShieldDeliveryAdapter(
             outbox_db_path=self.outbox_db_path,
             endpoint_url=adapter.endpoint_url,
+            tenant=ms_tenant,
             timeout=self.shield_timeout,
             allow_remote_https=True,
             allow_loopback_http=self.allow_loopback_channels,
@@ -449,12 +577,12 @@ class TijaraGuardPipeline:
             clean = explicit_target.strip()
             if not clean:
                 raise MalformedInputError("recipient_target must not be empty.")
-            # Verify caller's explicit target belongs to THIS exact draft contact_ref unless chatwoot conv_id matches route.
             if self.route_store is not None:
                 route = self.route_store.get(
                     tenant_id=draft["tenant_id"],
                     channel=channel,
                     contact_ref=draft["contact_ref"],
+                    external_conversation_id=draft["conversation_id"],
                 )
                 if route is not None:
                     if route["external_target"] != clean:
@@ -462,7 +590,15 @@ class TijaraGuardPipeline:
                             "Cross-customer or cross-channel recipient_target mismatch rejected."
                         )
                     return clean
-            if channel != "chatwoot" and self.privacy_gate.opaque_contact_ref(clean) != draft["contact_ref"]:
+
+            if channel == "chatwoot":
+                if not _CHATWOOT_CONV_ID_RE.fullmatch(clean) or f"cw-{clean}" != draft["conversation_id"]:
+                    raise DeliveryError(
+                        "Chatwoot recipient_target does not match draft conversation_id; cross-customer send blocked."
+                    )
+                return clean
+
+            if self.privacy_gate.opaque_contact_ref(clean) != draft["contact_ref"]:
                 raise DeliveryError(
                     "recipient_target does not match draft contact_ref; cross-customer send blocked."
                 )
@@ -473,6 +609,7 @@ class TijaraGuardPipeline:
                 tenant_id=draft["tenant_id"],
                 channel=channel,
                 contact_ref=draft["contact_ref"],
+                external_conversation_id=draft["conversation_id"],
             )
             if route is not None:
                 return str(route["external_target"])
@@ -508,6 +645,7 @@ class TijaraGuardPipeline:
                 adapter=ch_adapter,
                 target=target,
                 conversation_id=pre_draft["conversation_id"],
+                tenant=pre_draft["tenant_id"],
             )
 
         consumed_draft = self.ledger.consume_approval_for_dispatch(
@@ -515,6 +653,7 @@ class TijaraGuardPipeline:
             lease_id=approval_token.lease_id,
             approval_mac=approval_token.approval_mac,
             mode=self.mode,
+            expected_payload_sha256=approval_token.payload_sha256,
         )
 
         if self.mode == ExecutionMode.SHADOW:
@@ -656,6 +795,7 @@ class TijaraGuardPipeline:
                 adapter=ch_adapter,
                 target="recovery_lookup",
                 conversation_id=current["conversation_id"],
+                tenant=current["tenant_id"],
             )
 
         if active_delivery is None:

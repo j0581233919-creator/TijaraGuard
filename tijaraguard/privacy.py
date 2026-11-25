@@ -181,7 +181,7 @@ class PrivacyGate:
         if not isinstance(msg, InboundMessage):
             raise MalformedInputError("Expected InboundMessage instance.")
 
-        for id_value in (msg.message_id, msg.conversation_id, msg.requested_sku or ""):
+        for id_value in (msg.message_id, msg.conversation_id, msg.tenant_id, msg.requested_sku or ""):
             if id_value and self.verify_identifier_clean(id_value):
                 raise PrivacyViolationError(
                     "Supported PII detected in identifier field; rejected before persistence."
@@ -225,6 +225,7 @@ class PrivacyGate:
             "unsupported_entity_types": sorted(e.value for e in UNSUPPORTED_ENTITY_TYPES),
         }
 
+        safe_channel_meta = self.redact_structure(msg.channel_metadata or {})
         return RedactedEnvelope(
             message_id=msg.message_id,
             conversation_id=msg.conversation_id,
@@ -237,4 +238,6 @@ class PrivacyGate:
             redacted_text=redacted_text,
             requested_sku=msg.requested_sku,
             pii_summary=summary,
+            tenant_id=msg.tenant_id,
+            channel_metadata=safe_channel_meta,
         )
