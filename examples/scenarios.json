@@ -1,0 +1,33 @@
+{
+  "description": "Synthetic Arabic and English customer support test scenarios with checksum-valid synthetic PII.",
+  "scenarios": [
+    {
+      "name": "gulf_dialect_headphones_with_pii",
+      "language": "ar",
+      "inquiry": "هلا والله، كم سعر سماعة سوني WH-1000XM5؟ هويتي 1082345677 والايبان SA0380000000608010167519",
+      "expected_sku": "SONY-WH1000XM5",
+      "consent_to_contact": true
+    },
+    {
+      "name": "egyptian_dialect_espresso_with_mobile",
+      "language": "ar",
+      "inquiry": "بكام ماكينة قهوة ديلونجي EC685 ورقمي +966501234567",
+      "expected_sku": "DELONGHI-EC685",
+      "consent_to_contact": true
+    },
+    {
+      "name": "out_of_stock_vacuum",
+      "language": "ar",
+      "inquiry": "هل متوفر مكنسة دايسون V15 الحين؟",
+      "expected_sku": "DYSON-V15",
+      "consent_to_contact": true
+    },
+    {
+      "name": "expired_offer_powerbank",
+      "language": "ar",
+      "inquiry": "كم سعر شاحن انكر 737 وهل فيه خصم؟",
+      "expected_sku": "ANKER-737",
+      "consent_to_contact": true
+    }
+  ]
+}

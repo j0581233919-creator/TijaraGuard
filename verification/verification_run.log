@@ -1,0 +1,131 @@
+=== 1. UNIT TESTS ===
+test_cli_subcommands_via_subprocess (test_e2e_pipeline.TestE2EPipelineAndCLI.test_cli_subcommands_via_subprocess) ... ok
+test_full_demo_runs_and_passes_all_assertions (test_e2e_pipeline.TestE2EPipelineAndCLI.test_full_demo_runs_and_passes_all_assertions) ... ok
+test_malformed_inputs_fail_cleanly (test_e2e_pipeline.TestE2EPipelineAndCLI.test_malformed_inputs_fail_cleanly) ... ok
+test_luhn_invalid_saudi_id_not_flagged_as_national_id (test_gate1_privacy.TestGate1Privacy.test_luhn_invalid_saudi_id_not_flagged_as_national_id) ... ok
+test_pseudonymize_hash_fails_closed_without_salt (test_gate1_privacy.TestGate1Privacy.test_pseudonymize_hash_fails_closed_without_salt) ... ok
+test_redacts_saudi_id_iqama_iban_and_phones (test_gate1_privacy.TestGate1Privacy.test_redacts_saudi_id_iqama_iban_and_phones) ... ok
+test_zero_raw_pii_in_sqlite_logs_and_exceptions (test_gate1_privacy.TestGate1Privacy.test_zero_raw_pii_in_sqlite_logs_and_exceptions) ... ok
+test_adversarial_llm_expired_discount_claim_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_expired_discount_claim_blocked) ... ok
+test_adversarial_llm_out_of_stock_claimed_available_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_out_of_stock_claimed_available_blocked) ... ok
+test_adversarial_llm_pii_leak_in_draft_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_pii_leak_in_draft_blocked) ... ok
+test_adversarial_llm_wrong_price_and_unapproved_warranty_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_wrong_price_and_unapproved_warranty_blocked) ... ok
+test_arabic_dialect_inquiry_with_redacted_pii_resolves_sku_and_passes (test_gate2_commerce.TestGate2Commerce.test_arabic_dialect_inquiry_with_redacted_pii_resolves_sku_and_passes) ... ok
+test_missing_or_false_string_consent_or_missing_evidence_blocked (test_gate2_commerce.TestGate2Commerce.test_missing_or_false_string_consent_or_missing_evidence_blocked) ... ok
+test_expired_lease_rejected_and_audit_triggers_immutable (test_gate3_approval.TestGate3Approval.test_expired_lease_rejected_and_audit_triggers_immutable) ... ok
+test_payload_edit_or_direct_sqlite_tamper_invalidates_approval (test_gate3_approval.TestGate3Approval.test_payload_edit_or_direct_sqlite_tamper_invalidates_approval) ... ok
+test_shadow_mode_is_default_and_never_sends_externally (test_gate3_approval.TestGate3Approval.test_shadow_mode_is_default_and_never_sends_externally) ... ok
+test_single_use_lease_blocks_replay_and_concurrent_threads (test_gate3_approval.TestGate3Approval.test_single_use_lease_blocks_replay_and_concurrent_threads) ... ok
+test_unapproved_or_wrong_hash_or_malformed_mac_rejected (test_gate3_approval.TestGate3Approval.test_unapproved_or_wrong_hash_or_malformed_mac_rejected) ... ok
+test_compatibility_with_upstream_message_shield_example_receiver (test_gate4_delivery.TestGate4Delivery.test_compatibility_with_upstream_message_shield_example_receiver) ... ok
+test_duplicate_http_and_concurrent_retries_produce_one_logical_inbox_row (test_gate4_delivery.TestGate4Delivery.test_duplicate_http_and_concurrent_retries_produce_one_logical_inbox_row) ... ok
+test_lost_ack_enters_unknown_and_recovers_single_logical_delivery (test_gate4_delivery.TestGate4Delivery.test_lost_ack_enters_unknown_and_recovers_single_logical_delivery) ... ok
+test_non_loopback_endpoint_rejected (test_gate4_delivery.TestGate4Delivery.test_non_loopback_endpoint_rejected) ... ok
+test_process_sigkill_during_sending_recovers_after_lease_expiry (test_gate4_delivery.TestGate4Delivery.test_process_sigkill_during_sending_recovers_after_lease_expiry) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 45.008s
+
+OK
+
+=== 2. INSPECT DEPS ===
+{
+  "dont_write_bytecode": true,
+  "dependencies": {
+    "bayan_gate": {
+      "path": "/media/islam/shared pop/GitHub/bayan-gate/repo",
+      "version": "1.0.1"
+    },
+    "catalog_copilot": {
+      "path": "/media/islam/shared pop/GitHub/catalog-copilot/repo",
+      "version": "1.0.1"
+    },
+    "message_shield": {
+      "path": "/media/islam/shared pop/GitHub/message-shield/repo",
+      "version": "0.1.0"
+    }
+  }
+}
+
+=== 3. CLI DEMO ===
+{
+  "state_dir": "/media/islam/shared pop/GitHub/tijaraguard-prototype/.state/verification-demo",
+  "dependencies": {
+    "dont_write_bytecode": true,
+    "dependencies": {
+      "bayan_gate": {
+        "path": "/media/islam/shared pop/GitHub/bayan-gate/repo",
+        "version": "1.0.1"
+      },
+      "catalog_copilot": {
+        "path": "/media/islam/shared pop/GitHub/catalog-copilot/repo",
+        "version": "1.0.1"
+      },
+      "message_shield": {
+        "path": "/media/islam/shared pop/GitHub/message-shield/repo",
+        "version": "0.1.0"
+      }
+    }
+  },
+  "scenario_a_shadow": {
+    "draft_id": "DRAFT-5ACE1F41",
+    "detected_dialect": "GULF",
+    "resolved_sku": "SONY-WH1000XM5",
+    "pii_entity_count": 2,
+    "verification_status": "PASS",
+    "dispatch_mode": "SIMULATED_NO_SEND",
+    "dispatch_state": "SHADOW_RECORDED",
+    "dispatched_externally": false
+  },
+  "scenario_b_adversarial_llm": {
+    "draft_id": "DRAFT-B204988B",
+    "verification_status": "FAIL",
+    "ledger_state": "VERIFIED_BLOCKED",
+    "reason_count": 4
+  },
+  "scenario_c_payload_tamper": {
+    "draft_id": "DRAFT-645304F6",
+    "tampered_dispatch_rejected": true,
+    "final_ledger_state": "VERIFIED_BLOCKED"
+  },
+  "scenario_d_lost_ack_recovery": {
+    "draft_id": "DRAFT-31005BC9",
+    "initial_state_after_drop_ack": "UNKNOWN_DELIVERY",
+    "initial_shield_state": "UNKNOWN",
+    "recovered_state": "DELIVERED",
+    "recovered_shield_state": "DELIVERED",
+    "receipt_id": "rcpt-5255b81ac35e4938",
+    "delivery_key": "dc68a1057ac7afd4b84a99d8f9df5d162b9ca6bded0d30b3433d7cd6cf51e5ca",
+    "receiver_logical_inbox_rows": 1,
+    "receiver_post_attempts": 1
+  },
+  "security_and_audit_proof": {
+    "shadow_audit_chain_valid": true,
+    "shadow_audit_chain_errors": [],
+    "live_audit_chain_valid": true,
+    "live_audit_chain_errors": [],
+    "shadow_ledger_pii_leaks": 0,
+    "live_ledger_pii_leaks": 0,
+    "receiver_and_outbox_pii_leaks": 0,
+    "application_log_pii_leaks": 0
+  }
+}
+
+=== 4. VERIFY AUDIT ===
+{
+  "ledger_db": "/media/islam/shared pop/GitHub/tijaraguard-prototype/.state/verification-demo/ledger.sqlite3",
+  "event_count": 7,
+  "valid": true,
+  "errors": []
+}
+
+=== 5. ORIGINAL REPOS CHECK ===
+--- catalog-copilot ---
+12522d3b17767ae9a4766499b6495fd4231ebcfc
+--- bayan-gate ---
+1d6b83a46cb75484a434efe17be2e7d97885050c
+--- message-shield ---
+4ccbc2641c18b47a9feadbe41010a06fb2791275
+--- quote-judge ---
+0563ddd2af8646962a5d627402119b007a9cfc37
+--- message-shield pycache check ---

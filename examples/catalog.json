@@ -1,0 +1,54 @@
+[
+  {
+    "sku": "SONY-WH1000XM5",
+    "title_en": "Sony WH-1000XM5 Wireless Headphones",
+    "title_ar": "سماعة سوني WH-1000XM5",
+    "price": 1200.0,
+    "currency": "SAR",
+    "stock_quantity": 18,
+    "is_active": true,
+    "discount_percent": 10.0,
+    "offer_description_en": "National Day Offer",
+    "offer_description_ar": "عرض خاص لفترة محدودة",
+    "offer_valid_from": "2026-01-01",
+    "offer_valid_until": "2027-12-31",
+    "category": "Audio"
+  },
+  {
+    "sku": "DELONGHI-EC685",
+    "title_en": "DeLonghi Dedica Espresso Machine EC685",
+    "title_ar": "ماكينة قهوة ديلونجي EC685",
+    "price": 850.0,
+    "currency": "SAR",
+    "stock_quantity": 9,
+    "is_active": true,
+    "discount_percent": 0.0,
+    "category": "Kitchen"
+  },
+  {
+    "sku": "DYSON-V15",
+    "title_en": "Dyson V15 Vacuum Cleaner",
+    "title_ar": "مكنسة دايسون V15",
+    "price": 2400.0,
+    "currency": "SAR",
+    "stock_quantity": 0,
+    "is_active": true,
+    "discount_percent": 0.0,
+    "category": "Home"
+  },
+  {
+    "sku": "ANKER-737",
+    "title_en": "Anker 737 Power Bank",
+    "title_ar": "شاحن انكر 737 متنقل",
+    "price": 450.0,
+    "currency": "SAR",
+    "stock_quantity": 14,
+    "is_active": true,
+    "discount_percent": 20.0,
+    "offer_description_en": "Expired Winter Sale",
+    "offer_description_ar": "عرض الشتاء المنتهي",
+    "offer_valid_from": "2025-01-01",
+    "offer_valid_until": "2025-12-31",
+    "category": "Accessories"
+  }
+]
