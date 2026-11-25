@@ -9,6 +9,7 @@ test_redacts_saudi_id_iqama_iban_and_phones (test_gate1_privacy.TestGate1Privacy
 test_requested_sku_with_pii_rejected_without_persistence (test_gate1_privacy.TestGate1Privacy.test_requested_sku_with_pii_rejected_without_persistence) ... ok
 test_zero_raw_pii_in_sqlite_logs_and_exceptions (test_gate1_privacy.TestGate1Privacy.test_zero_raw_pii_in_sqlite_logs_and_exceptions) ... ok
 test_adversarial_llm_expired_discount_claim_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_expired_discount_claim_blocked) ... ok
+test_adversarial_llm_numeric_pii_as_price_redacted_cleanly (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_numeric_pii_as_price_redacted_cleanly) ... ok
 test_adversarial_llm_out_of_stock_claimed_available_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_out_of_stock_claimed_available_blocked) ... ok
 test_adversarial_llm_pii_leak_in_draft_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_pii_leak_in_draft_blocked) ... ok
 test_adversarial_llm_wrong_price_and_unapproved_warranty_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_wrong_price_and_unapproved_warranty_blocked) ... ok
@@ -32,7 +33,7 @@ test_receiver_rejects_dup_json_keys_transfer_encoding_and_missing_idem (test_gat
 test_shadow_mode_blocks_recover_oversized_preserves_lease_and_deliv_idempotent (test_gate4_delivery.TestGate4Delivery.test_shadow_mode_blocks_recover_oversized_preserves_lease_and_deliv_idempotent) ... ok
 
 ----------------------------------------------------------------------
-Ran 31 tests in 56.499s
+Ran 32 tests in 57.108s
 
 OK
 
@@ -76,7 +77,7 @@ OK
     }
   },
   "scenario_a_shadow": {
-    "draft_id": "DRAFT-E933D799",
+    "draft_id": "DRAFT-3B660CFB",
     "detected_dialect": "GULF",
     "resolved_sku": "SONY-WH1000XM5",
     "pii_entity_count": 2,
@@ -86,24 +87,24 @@ OK
     "dispatched_externally": false
   },
   "scenario_b_adversarial_llm": {
-    "draft_id": "DRAFT-80198112",
+    "draft_id": "DRAFT-15A88751",
     "verification_status": "FAIL",
     "ledger_state": "VERIFIED_BLOCKED",
     "reason_count": 4
   },
   "scenario_c_payload_tamper": {
-    "draft_id": "DRAFT-72DD0320",
+    "draft_id": "DRAFT-A74FDC54",
     "tampered_dispatch_rejected": true,
     "final_ledger_state": "VERIFIED_BLOCKED"
   },
   "scenario_d_lost_ack_recovery": {
-    "draft_id": "DRAFT-2EF763C8",
+    "draft_id": "DRAFT-F9C9A8D2",
     "initial_state_after_drop_ack": "UNKNOWN_DELIVERY",
     "initial_shield_state": "UNKNOWN",
     "recovered_state": "DELIVERED",
     "recovered_shield_state": "DELIVERED",
-    "receipt_id": "rcpt-808df71783404044",
-    "delivery_key": "8031a1e7dfc81c35f47a9bfb36d88d49625e06d0e1fe293e362c514bccc18119",
+    "receipt_id": "rcpt-ceada534d3b544e4",
+    "delivery_key": "44f2cdf246623dcfb9e279aaf6d4a13bf1a9caf23a0f9b124a8bb7b7a652583e",
     "receiver_logical_inbox_rows": 1,
     "receiver_post_attempts": 1
   },

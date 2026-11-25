@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import sys
@@ -390,6 +391,56 @@ class TestGate3Approval(unittest.TestCase):
         self.assertFalse(ok_td)
         self.assertTrue(any("tail deletion" in e.lower() for e in errs_td))
 
+        # Clean closed WAL copy creates zero -shm/-wal sidecars and works in 0555/0444 read-only dir
+        ro_work = Path(tempfile.mkdtemp(prefix="tg_ro_audit_"))
+        try:
+            ro_db = ro_work / "archived_ledger.sqlite3"
+            shutil.copy2(self.ledger_db, ro_db)
+            ok_clean, cnt_clean, errs_clean = verify_audit_database_readonly(ro_db)
+            self.assertTrue(ok_clean, f"Expected clean read-only audit, got {errs_clean}")
+            self.assertGreaterEqual(cnt_clean, 2)
+            self.assertFalse(Path(f"{ro_db}-shm").exists())
+            self.assertFalse(Path(f"{ro_db}-wal").exists())
+
+            os.chmod(ro_db, 0o444)
+            os.chmod(ro_work, 0o555)
+            ok_ro_dir, _cnt_ro, errs_ro = verify_audit_database_readonly(ro_db)
+            self.assertTrue(ok_ro_dir, f"Expected clean 0555/0444 read-only dir audit, got {errs_ro}")
+        finally:
+            os.chmod(ro_work, 0o755)
+            if (ro_work / "archived_ledger.sqlite3").exists():
+                os.chmod(ro_work / "archived_ledger.sqlite3", 0o644)
+            shutil.rmtree(ro_work, ignore_errors=True)
+
+        # Forged trigger on wrong table (drafts) and conditional WHEN trigger rejected
+        copy_wrong_tbl = self.tmpdir / "ledger_wrong_trig.sqlite3"
+        shutil.copy2(self.ledger_db, copy_wrong_tbl)
+        conn3 = sqlite3.connect(str(copy_wrong_tbl))
+        conn3.execute("DROP TRIGGER audit_events_no_update")
+        conn3.execute(
+            "CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON drafts "
+            "BEGIN SELECT RAISE(ABORT, 'fake'); END;"
+        )
+        conn3.commit()
+        conn3.close()
+        ok_wt, _cnt, errs_wt = verify_audit_database_readonly(copy_wrong_tbl)
+        self.assertFalse(ok_wt)
+        self.assertTrue(any("trigger" in e.lower() for e in errs_wt))
+
+        copy_cond_trig = self.tmpdir / "ledger_cond_trig.sqlite3"
+        shutil.copy2(self.ledger_db, copy_cond_trig)
+        conn4 = sqlite3.connect(str(copy_cond_trig))
+        conn4.execute("DROP TRIGGER audit_events_no_delete")
+        conn4.execute(
+            "CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events "
+            "WHEN 1=0 BEGIN SELECT RAISE(ABORT, 'bypass'); END;"
+        )
+        conn4.commit()
+        conn4.close()
+        ok_ct, _cnt, errs_ct = verify_audit_database_readonly(copy_cond_trig)
+        self.assertFalse(ok_ct)
+        self.assertTrue(any("trigger" in e.lower() for e in errs_ct))
+
     def test_delivery_state_machine_blocks_illegal_transitions_and_operator_pii_redacted(self) -> None:
         res = self.pipe.process_inbound(
             make_inbound_message(
@@ -405,6 +456,21 @@ class TestGate3Approval(unittest.TestCase):
         # Empty actor rejected in edit_draft_body
         with self.assertRaises(MalformedInputError):
             self.pipe.edit_draft(res["draft_id"], new_body="تجربة", actor="   ")
+
+        # Non-string notes / reason rejected cleanly before persistence
+        with self.assertRaises(MalformedInputError):
+            self.pipe.approve(
+                res["draft_id"],
+                reviewer_id="supervisor_1",
+                expected_payload_sha256=res["payload_sha256"],
+                notes=1082345677,  # type: ignore[arg-type]
+            )
+        with self.assertRaises(MalformedInputError):
+            self.pipe.reject(
+                res["draft_id"],
+                reviewer_id="supervisor_1",
+                reason=1082345677,  # type: ignore[arg-type]
+            )
 
         # Operator reject reason containing PII is redacted before immutable audit storage
         self.pipe.reject(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import re
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
@@ -114,15 +115,26 @@ class PrivacyGate:
         return res.redacted_text
 
     def redact_structure(self, value: Any) -> Any:
-        """Recursively redacts all strings within nested dicts/lists/tuples."""
+        """Recursively redacts all strings and numeric PII within nested structures."""
         if isinstance(value, str):
             return self.redact_text_full(value)
+        if not isinstance(value, bool) and isinstance(value, (int, float)):
+            candidates = [str(value)]
+            if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+                candidates.append(str(int(value)))
+            for candidate in candidates:
+                if self.verify_text_clean(candidate):
+                    return "[REDACTED_PII_VALUE]"
+            return value
         if isinstance(value, list):
             return [self.redact_structure(item) for item in value]
         if isinstance(value, tuple):
             return tuple(self.redact_structure(item) for item in value)
         if isinstance(value, dict):
-            return {k: self.redact_structure(v) for k, v in value.items()}
+            return {
+                (self.redact_text_full(k) if isinstance(k, str) else k): self.redact_structure(v)
+                for k, v in value.items()
+            }
         return value
 
     def redact_text(self, text: str) -> Tuple[str, Dict[str, Any]]:
@@ -146,6 +158,15 @@ class PrivacyGate:
         spans = self.engine.detect(text, min_confidence=self.min_confidence)
         return sorted({span.entity_type.value for span in spans})
 
+    def verify_identifier_clean(self, value: str) -> List[str]:
+        """Detects PII inside identifier tokens including '_' or '-' separated segments."""
+        if not isinstance(value, str) or not value:
+            return []
+        normalized = re.sub(r"[_-]+", " ", value)
+        direct = self.verify_text_clean(value)
+        split = self.verify_text_clean(normalized) if normalized != value else []
+        return sorted(set(direct + split))
+
     def opaque_contact_ref(self, raw_contact_target: str) -> str:
         """Converts raw phone/email into an irreversible opaque handle for safe persistence."""
         digest = hmac.new(
@@ -160,10 +181,11 @@ class PrivacyGate:
         if not isinstance(msg, InboundMessage):
             raise MalformedInputError("Expected InboundMessage instance.")
 
-        if msg.requested_sku and self.verify_text_clean(msg.requested_sku):
-            raise PrivacyViolationError(
-                "Supported PII detected in requested_sku; rejected before persistence."
-            )
+        for id_value in (msg.message_id, msg.conversation_id, msg.requested_sku or ""):
+            if id_value and self.verify_identifier_clean(id_value):
+                raise PrivacyViolationError(
+                    "Supported PII detected in identifier field; rejected before persistence."
+                )
 
         redacted_text, text_meta = self.redact_text(msg.raw_text)
 

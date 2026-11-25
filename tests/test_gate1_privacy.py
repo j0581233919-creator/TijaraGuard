@@ -156,14 +156,27 @@ class TestGate1Privacy(unittest.TestCase):
             mode=ExecutionMode.SHADOW,
         )
         with capture_tijaraguard_logs() as log_buf:
-            for bad_sku in (SYNTH_GCC_IBAN, SYNTH_SAUDI_ID):
+            for bad_sku in (
+                SYNTH_GCC_IBAN,
+                SYNTH_SAUDI_ID,
+                f"SKU_{SYNTH_GCC_IBAN}",
+                f"SKU_{SYNTH_SAUDI_ID}",
+            ):
                 msg = make_inbound_message(
-                    message_id=f"msg-sku-{bad_sku[:6]}",
+                    message_id=f"msg-sku-{bad_sku[-6:]}",
                     raw_text="كم سعر سماعة سوني؟",
                     requested_sku=bad_sku,
                 )
                 with self.assertRaises(PrivacyViolationError):
                     pipe.process_inbound(msg)
+
+            with self.assertRaises(PrivacyViolationError):
+                pipe.process_inbound(
+                    make_inbound_message(
+                        message_id=f"MSG_{SYNTH_SAUDI_ID}",
+                        raw_text="كم سعر سماعة سوني؟",
+                    )
+                )
 
             # Non-identifier ASCII/whitespace injection in requested_sku rejected cleanly
             with self.assertRaises(MalformedInputError):

@@ -155,6 +155,25 @@ class TestGate2Commerce(unittest.TestCase):
             [],
         )
 
+    def test_adversarial_llm_numeric_pii_as_price_redacted_cleanly(self) -> None:
+        msg = make_inbound_message(
+            message_id="msg-g2-numeric-pii-price",
+            raw_text="كم سعر ماكينة قهوة ديلونجي EC685؟",
+            requested_sku="DELONGHI-EC685",
+        )
+
+        def numeric_leaky_llm(_base: str, _ctx: Dict[str, Any]) -> str:
+            return f"مرحباً، السعر {SYNTH_SAUDI_ID} SAR"
+
+        res = self.pipe.process_inbound(msg, custom_llm_callable=numeric_leaky_llm)
+        self.assertEqual(res["verification_status"], "FAIL")
+        self.assertEqual(res["state"], DraftState.VERIFIED_BLOCKED.value)
+        self.assertNotIn(SYNTH_SAUDI_ID, res["draft_body"])
+        self.assertEqual(
+            scan_sqlite_for_secrets(self.tmpdir / "ledger.sqlite3", ALL_SYNTH_PII_SECRETS),
+            [],
+        )
+
     def test_missing_or_false_string_consent_or_missing_evidence_blocked(self) -> None:
         for idx, (consent, evidence) in enumerate(
             [

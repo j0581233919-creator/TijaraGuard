@@ -75,10 +75,15 @@ class TijaraGuardPipeline:
             )
 
     def _assert_evaluation_pii_clean(self, evaluation: CommercialEvaluation) -> None:
+        if evaluation.sku:
+            leaked_sku = self.privacy_gate.verify_identifier_clean(evaluation.sku)
+            if leaked_sku:
+                raise PrivacyViolationError(
+                    f"Gate 2 evaluation retained PII in 'sku': {leaked_sku}"
+                )
         checks = [
             ("body", evaluation.body),
             ("subject", evaluation.subject),
-            ("sku", evaluation.sku or ""),
             ("reasons", canonical_json(evaluation.reasons)),
             ("verification_report", canonical_json(evaluation.verification_report_dict)),
         ]
@@ -144,6 +149,8 @@ class TijaraGuardPipeline:
         ttl_seconds: int = 900,
     ) -> ApprovalToken:
         """Issues a cryptographic single-use human approval lease for a verified draft."""
+        if not isinstance(notes, str):
+            raise MalformedInputError("notes must be a string.")
         safe_notes = self.privacy_gate.redact_text_full(notes)
         token = self.ledger.approve_draft(
             draft_id=draft_id,
@@ -162,6 +169,8 @@ class TijaraGuardPipeline:
 
     def reject(self, draft_id: str, *, reviewer_id: str, reason: str) -> Dict[str, Any]:
         """Rejects a pending or approved draft and revokes any active lease."""
+        if not isinstance(reason, str):
+            raise MalformedInputError("reason must be a string.")
         safe_reason = self.privacy_gate.redact_text_full(reason)
         row = self.ledger.reject_draft(draft_id, reviewer_id=reviewer_id, reason=safe_reason)
         logger.info("gate3_rejected draft_id=%s reviewer=%s", draft_id, reviewer_id)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -146,15 +147,18 @@ _ALLOWED_DELIVERY_TRANSITIONS: Dict[str, set[str]] = {
 
 
 def verify_audit_database_readonly(db_path: str | Path) -> Tuple[bool, int, List[str]]:
-    """Verifies table/trigger presence, tail consistency, and hash chain in ?mode=ro."""
+    """Verifies table/trigger presence, tail consistency, and hash chain read-only."""
     resolved = Path(db_path).resolve()
     if not resolved.is_file():
         return False, 0, [f"Ledger database not found: {resolved}"]
 
     errors: List[str] = []
     event_count = 0
+    wal_path = Path(f"{resolved}-wal")
+    has_live_wal = wal_path.is_file() and wal_path.stat().st_size > 0
+    uri = f"{resolved.as_uri()}?mode=ro" if has_live_wal else f"{resolved.as_uri()}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True, timeout=5.0)
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
     except sqlite3.DatabaseError as exc:
         return False, 0, [f"Failed to open SQLite database read-only: {exc}"]
@@ -171,14 +175,23 @@ def verify_audit_database_readonly(db_path: str | Path) -> Tuple[bool, int, List
             return False, 0, errors
 
         triggers = {
-            r["name"]: (r["sql"] or "").upper()
+            r["name"]: re.sub(r"\s+", " ", (r["sql"] or "").strip()).upper()
             for r in conn.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name='audit_events'"
             ).fetchall()
         }
-        for req_trig in ("audit_events_no_update", "audit_events_no_delete"):
+        expected_triggers = {
+            "audit_events_no_update": "BEFORE UPDATE ON AUDIT_EVENTS",
+            "audit_events_no_delete": "BEFORE DELETE ON AUDIT_EVENTS",
+        }
+        for req_trig, required_clause in expected_triggers.items():
             trig_sql = triggers.get(req_trig)
-            if not trig_sql or "RAISE(ABORT" not in trig_sql:
+            if (
+                not trig_sql
+                or required_clause not in trig_sql
+                or " WHEN " in trig_sql
+                or "RAISE(ABORT" not in trig_sql
+            ):
                 errors.append(f"Missing or weakened immutability trigger: {req_trig}")
 
         draft_count = int(conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0])
@@ -505,6 +518,8 @@ class ApprovalLedger:
         """Issues a cryptographic single-use human approval lease bound to payload_sha256."""
         if not isinstance(reviewer_id, str) or not reviewer_id.strip():
             raise MalformedInputError("reviewer_id must be a non-empty string.")
+        if not isinstance(notes, str):
+            raise MalformedInputError("notes must be a string.")
         if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 86400:
             raise MalformedInputError("ttl_seconds must be an integer between 1 and 86400.")
         if not is_valid_sha256_hex(expected_payload_sha256):
@@ -601,6 +616,8 @@ class ApprovalLedger:
         """Rejects a draft and revokes any unconsumed approval lease."""
         if not isinstance(reviewer_id, str) or not reviewer_id.strip():
             raise MalformedInputError("reviewer_id must be a non-empty string.")
+        if not isinstance(reason, str):
+            raise MalformedInputError("reason must be a string.")
         with self._connect(write=True) as conn:
             row = conn.execute(
                 "SELECT * FROM drafts WHERE draft_id=?", (draft_id,)
