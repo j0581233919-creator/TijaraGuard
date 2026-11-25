@@ -121,9 +121,119 @@ def compute_draft_payload_sha256(row_or_fields: Dict[str, Any]) -> str:
         "subject": row_or_fields["subject"],
         "body": row_or_fields["body"],
         "contact_ref": row_or_fields["contact_ref"],
+        "contact_channel": row_or_fields["contact_channel"],
+        "consent_to_contact": bool(int(row_or_fields["consent_to_contact"])),
+        "consent_evidence": str(row_or_fields.get("consent_evidence") or ""),
         "verification_status": row_or_fields["verification_status"],
     }
     return canonical_sha256(canonical_payload)
+
+
+_ALLOWED_DELIVERY_TRANSITIONS: Dict[str, set[str]] = {
+    DraftState.DISPATCHING.value: {
+        DraftState.ACCEPTED_DELIVERY.value,
+        DraftState.UNKNOWN_DELIVERY.value,
+        DraftState.FAILED_DELIVERY.value,
+    },
+    DraftState.UNKNOWN_DELIVERY.value: {
+        DraftState.ACCEPTED_DELIVERY.value,
+        DraftState.FAILED_DELIVERY.value,
+    },
+    DraftState.ACCEPTED_DELIVERY.value: {
+        DraftState.DELIVERED.value,
+    },
+}
+
+
+def verify_audit_database_readonly(db_path: str | Path) -> Tuple[bool, int, List[str]]:
+    """Verifies table/trigger presence, tail consistency, and hash chain in ?mode=ro."""
+    resolved = Path(db_path).resolve()
+    if not resolved.is_file():
+        return False, 0, [f"Ledger database not found: {resolved}"]
+
+    errors: List[str] = []
+    event_count = 0
+    try:
+        conn = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.DatabaseError as exc:
+        return False, 0, [f"Failed to open SQLite database read-only: {exc}"]
+
+    try:
+        tables = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not {"drafts", "approvals", "audit_events"}.issubset(tables):
+            errors.append("Missing required ledger tables (drafts, approvals, audit_events).")
+            return False, 0, errors
+
+        triggers = {
+            r["name"]: (r["sql"] or "").upper()
+            for r in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ).fetchall()
+        }
+        for req_trig in ("audit_events_no_update", "audit_events_no_delete"):
+            trig_sql = triggers.get(req_trig)
+            if not trig_sql or "RAISE(ABORT" not in trig_sql:
+                errors.append(f"Missing or weakened immutability trigger: {req_trig}")
+
+        draft_count = int(conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0])
+        rows = conn.execute("SELECT * FROM audit_events ORDER BY seq ASC").fetchall()
+        event_count = len(rows)
+
+        if draft_count > 0 and event_count == 0:
+            errors.append("Draft records exist with zero audit_events (missing history).")
+
+        if "sqlite_sequence" in tables:
+            seq_row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='audit_events'"
+            ).fetchone()
+            if seq_row is not None:
+                recorded_seq = int(seq_row["seq"])
+                max_row_seq = int(rows[-1]["seq"]) if rows else 0
+                if recorded_seq != max_row_seq:
+                    errors.append(
+                        f"Audit tail deletion suspected: sqlite_sequence={recorded_seq}, max_seq={max_row_seq}"
+                    )
+
+        expected_prev = _GENESIS_HASH
+        for idx, row in enumerate(rows, start=1):
+            if row["seq"] != idx:
+                errors.append(f"Sequence gap at row {idx}: got seq={row['seq']}")
+            if (
+                not is_valid_sha256_hex(row["prev_hash"])
+                or not is_valid_sha256_hex(expected_prev)
+                or not hmac.compare_digest(row["prev_hash"].lower(), expected_prev.lower())
+            ):
+                errors.append(f"Chain break at seq={row['seq']}: prev_hash mismatch")
+            if not is_valid_sha256_hex(row["event_hash"]):
+                errors.append(f"Invalid non-hex event_hash at seq={row['seq']}")
+                expected_prev = str(row["event_hash"])
+                continue
+            recomputed = _compute_audit_event_hash(
+                draft_id=row["draft_id"],
+                event_type=row["event_type"],
+                from_state=row["from_state"],
+                to_state=row["to_state"],
+                actor=row["actor"],
+                payload_sha256=row["payload_sha256"],
+                details_json=row["details_json"],
+                created_at=row["created_at"],
+                prev_hash=row["prev_hash"],
+            )
+            if not hmac.compare_digest(recomputed.lower(), row["event_hash"].lower()):
+                errors.append(f"Tampered audit event digest at seq={row['seq']}")
+            expected_prev = row["event_hash"]
+    except sqlite3.DatabaseError as exc:
+        errors.append(f"SQLite verification error: {exc}")
+    finally:
+        conn.close()
+
+    return len(errors) == 0, event_count, errors
 
 
 def compute_approval_mac(
@@ -296,6 +406,9 @@ class ApprovalLedger:
                 "subject": evaluation.subject,
                 "body": evaluation.body,
                 "contact_ref": envelope.contact_ref,
+                "contact_channel": envelope.contact_channel,
+                "consent_to_contact": 1 if envelope.consent_to_contact else 0,
+                "consent_evidence": envelope.consent_evidence,
                 "verification_status": evaluation.verification_status,
             }
         )
@@ -419,7 +532,9 @@ class ApprovalLedger:
                 )
 
             live_hash = compute_draft_payload_sha256(draft)
-            if not hmac.compare_digest(live_hash, draft["payload_sha256"]):
+            if not is_valid_sha256_hex(draft["payload_sha256"]) or not hmac.compare_digest(
+                live_hash, draft["payload_sha256"].lower()
+            ):
                 raise ApprovalTamperError("Stored draft payload digest mismatch prior to approval.")
             if not hmac.compare_digest(live_hash, expected_payload_sha256.lower()):
                 raise ApprovalTamperError(
@@ -530,6 +645,9 @@ class ApprovalLedger:
         actor: str,
     ) -> Dict[str, Any]:
         """Updates draft body with re-verified evaluation and revokes any active approval."""
+        if not isinstance(actor, str) or not actor.strip():
+            raise MalformedInputError("actor must be a non-empty string.")
+        actor_clean = actor.strip()
         with self._connect(write=True) as conn:
             row = conn.execute(
                 "SELECT * FROM drafts WHERE draft_id=?", (draft_id,)
@@ -538,15 +656,13 @@ class ApprovalLedger:
                 raise MalformedInputError(f"Unknown draft_id '{draft_id}'.")
             draft = dict(row)
             from_state = draft["state"]
-            if from_state in (
-                DraftState.DISPATCHING.value,
-                DraftState.UNKNOWN_DELIVERY.value,
-                DraftState.ACCEPTED_DELIVERY.value,
-                DraftState.DELIVERED.value,
-                DraftState.SHADOW_RECORDED.value,
+            if from_state not in (
+                DraftState.PENDING_APPROVAL.value,
+                DraftState.VERIFIED_BLOCKED.value,
+                DraftState.APPROVED.value,
             ):
                 raise VerificationBlockedError(
-                    f"Cannot edit draft '{draft_id}' after dispatch state '{from_state}'."
+                    f"Cannot edit draft '{draft_id}' in terminal or post-dispatch state '{from_state}'."
                 )
 
             cur = conn.execute(
@@ -572,6 +688,9 @@ class ApprovalLedger:
                     "subject": draft["subject"],
                     "body": evaluation.body,
                     "contact_ref": draft["contact_ref"],
+                    "contact_channel": draft["contact_channel"],
+                    "consent_to_contact": draft["consent_to_contact"],
+                    "consent_evidence": draft["consent_evidence"],
                     "verification_status": evaluation.verification_status,
                 }
             )
@@ -598,7 +717,7 @@ class ApprovalLedger:
                 event_type="DRAFT_EDITED_APPROVAL_REVOKED",
                 from_state=from_state,
                 to_state=to_state,
-                actor=actor,
+                actor=actor_clean,
                 payload_sha256=new_hash,
                 details={
                     "revoked_approvals": revoked_count,
@@ -662,14 +781,21 @@ class ApprovalLedger:
                 expires_at=approval["expires_at"],
             )
 
+            consent_ok = (
+                draft["consent_to_contact"] == 1
+                and bool(str(draft["consent_evidence"]).strip())
+                and draft["verification_status"] == "PASS"
+            )
             hash_ok = (
-                is_valid_sha256_hex(draft["payload_sha256"])
+                consent_ok
+                and is_valid_sha256_hex(draft["payload_sha256"])
                 and is_valid_sha256_hex(approval["payload_sha256"])
                 and hmac.compare_digest(live_hash, draft["payload_sha256"].lower())
                 and hmac.compare_digest(live_hash, approval["payload_sha256"].lower())
             )
             mac_ok = (
-                hmac.compare_digest(expected_mac, approval["approval_mac"].lower())
+                is_valid_sha256_hex(approval["approval_mac"])
+                and hmac.compare_digest(expected_mac, approval["approval_mac"].lower())
                 and hmac.compare_digest(expected_mac, approval_mac.lower())
             )
 
@@ -776,7 +902,7 @@ class ApprovalLedger:
         details: Optional[Dict[str, Any]] = None,
         actor: str = "gate4_delivery",
     ) -> Dict[str, Any]:
-        """Transitions a dispatching/unknown/accepted draft through durable delivery states."""
+        """Transitions a dispatching/unknown/accepted draft through allowed delivery states."""
         with self._connect(write=True) as conn:
             row = conn.execute(
                 "SELECT * FROM drafts WHERE draft_id=?", (draft_id,)
@@ -784,6 +910,11 @@ class ApprovalLedger:
             if row is None:
                 raise MalformedInputError(f"Unknown draft_id '{draft_id}'.")
             from_state = row["state"]
+            allowed_targets = _ALLOWED_DELIVERY_TRANSITIONS.get(from_state, set())
+            if to_state.value not in allowed_targets:
+                raise VerificationBlockedError(
+                    f"Illegal delivery state transition '{from_state}' -> '{to_state.value}'."
+                )
             new_key = delivery_key or row["delivery_key"]
             new_receipt = receipt_id or row["receipt_id"]
 
@@ -828,31 +959,9 @@ class ApprovalLedger:
             return [dict(r) for r in rows]
 
     def verify_audit_chain(self) -> Tuple[bool, List[str]]:
-        """Verifies hash chain continuity and recomputed hashes across audit_events."""
-        errors: List[str] = []
-        with self._connect(write=False) as conn:
-            rows = conn.execute("SELECT * FROM audit_events ORDER BY seq ASC").fetchall()
-            expected_prev = _GENESIS_HASH
-            for idx, row in enumerate(rows, start=1):
-                if row["seq"] != idx:
-                    errors.append(f"Sequence gap at row {idx}: got seq={row['seq']}")
-                if row["prev_hash"] != expected_prev:
-                    errors.append(f"Chain break at seq={row['seq']}: prev_hash mismatch")
-                recomputed = _compute_audit_event_hash(
-                    draft_id=row["draft_id"],
-                    event_type=row["event_type"],
-                    from_state=row["from_state"],
-                    to_state=row["to_state"],
-                    actor=row["actor"],
-                    payload_sha256=row["payload_sha256"],
-                    details_json=row["details_json"],
-                    created_at=row["created_at"],
-                    prev_hash=row["prev_hash"],
-                )
-                if not hmac.compare_digest(recomputed, row["event_hash"]):
-                    errors.append(f"Tampered audit event digest at seq={row['seq']}")
-                expected_prev = row["event_hash"]
-        return len(errors) == 0, errors
+        """Verifies triggers, sequence integrity, and hash chain across audit_events."""
+        valid, _event_count, errors = verify_audit_database_readonly(self.db_path)
+        return valid, errors
 
     def scan_for_raw_secrets(self, raw_secrets: List[str]) -> List[Dict[str, Any]]:
         """Scans all persisted ledger tables for raw PII substrings (returns locations only)."""

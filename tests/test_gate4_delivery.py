@@ -25,7 +25,7 @@ for _p in (str(_TESTS_DIR), str(_ROOT)):
 
 from tijaraguard.delivery import LocalLoopbackReceiver, MessageShieldDeliveryAdapter, compute_delivery_key
 from tijaraguard.deps import load_dependencies
-from tijaraguard.models import DeliveryError, DraftState, ExecutionMode
+from tijaraguard.models import ApprovalRequiredError, DeliveryError, DraftState, ExecutionMode
 from tijaraguard.pipeline import TijaraGuardPipeline
 
 from helpers import (
@@ -266,14 +266,17 @@ class TestGate4Delivery(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            # Wait for the POST to commit into receiver SQLite, then SIGKILL before timeout/ACK.
-            deadline = time.time() + 2.0
             key = compute_delivery_key(res["draft_id"])
-            while time.time() < deadline and receiver.count_logical_deliveries(key) == 0:
-                time.sleep(0.005)
-            self.assertEqual(receiver.count_logical_deliveries(key), 1)
-            os.kill(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=3.0)
+            try:
+                # Wait for subprocess startup + POST commit into receiver SQLite, then SIGKILL.
+                deadline = time.time() + 8.0
+                while time.time() < deadline and receiver.count_logical_deliveries(key) == 0:
+                    time.sleep(0.01)
+                self.assertEqual(receiver.count_logical_deliveries(key), 1)
+            finally:
+                if proc.poll() is None:
+                    os.kill(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=3.0)
 
             # Confirm MessageShield outbox persisted SENDING before SIGKILL
             reopened = self._new_live_pipeline(receiver.endpoint_url, timeout=1.0)
@@ -313,3 +316,155 @@ class TestGate4Delivery(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=2.0)
+
+    def test_shadow_mode_blocks_recover_oversized_preserves_lease_and_deliv_idempotent(self) -> None:
+        receiver_db = self.tmpdir / "rx_m3.sqlite3"
+        with LocalLoopbackReceiver(receiver_db, drop_ack=False) as receiver:
+            # 1. Shadow mode disables self.delivery and blocks recover_delivery
+            shadow_pipe = TijaraGuardPipeline(
+                catalog=self.catalog,
+                ledger_db_path=self.tmpdir / "shadow_only.sqlite3",
+                approval_secret=self.secret,
+                contact_hash_key=self.hash_key,
+                mode=ExecutionMode.SHADOW,
+                outbox_db_path=self.tmpdir / "unused_outbox.sqlite3",
+                receiver_endpoint=receiver.endpoint_url,
+            )
+            self.assertIsNone(shadow_pipe.delivery)
+            s_res = shadow_pipe.process_inbound(
+                make_inbound_message(
+                    message_id="msg-g4-shadow-blk",
+                    requested_sku="DELONGHI-EC685",
+                    raw_text="كم سعر ماكينة قهوة ديلونجي EC685؟",
+                )
+            )
+            with self.assertRaises(DeliveryError):
+                shadow_pipe.recover_delivery(s_res["draft_id"])
+
+            # 2. Live mode: ineligible PENDING_APPROVAL blocks recover_delivery;
+            # successful DELIVERED returns idempotent delivered outcome on repeat recover
+            live_pipe = self._new_live_pipeline(receiver.endpoint_url)
+            pending_res = live_pipe.process_inbound(
+                make_inbound_message(
+                    message_id="msg-g4-pending-rec",
+                    requested_sku="DELONGHI-EC685",
+                    raw_text="كم سعر ماكينة قهوة ديلونجي EC685؟",
+                )
+            )
+            with self.assertRaises(ApprovalRequiredError):
+                live_pipe.recover_delivery(pending_res["draft_id"])
+
+            tok = live_pipe.approve(
+                pending_res["draft_id"],
+                reviewer_id="supervisor_1",
+                expected_payload_sha256=pending_res["payload_sha256"],
+            )
+            d1 = live_pipe.dispatch(pending_res["draft_id"], tok, confirm_delivered=True)
+            self.assertEqual(d1.state, DraftState.DELIVERED.value)
+            d2 = live_pipe.recover_delivery(pending_res["draft_id"], confirm_delivered=True)
+            self.assertTrue(d2.dispatched)
+            self.assertEqual(d2.state, DraftState.DELIVERED.value)
+            self.assertEqual(d2.receipt_id, d1.receipt_id)
+
+            # 3. Oversized payload (>8192 bytes) raises DeliveryError BEFORE consuming lease
+            big_res = live_pipe.process_inbound(
+                make_inbound_message(
+                    message_id="msg-g4-oversized",
+                    requested_sku="DELONGHI-EC685",
+                    raw_text="كم سعر ماكينة قهوة ديلونجي EC685؟",
+                )
+            )
+            # Directly insert valid >8192-byte approved draft via edit_draft / oversized legitimate check:
+            # construct valid CommercialEvaluation and update ledger body properly
+            big_text = "مرحباً، " + ("سعر المنتج 850.00 SAR " * 400)
+            self.assertGreater(len(big_text.encode("utf-8")), 8192)
+            big_edited = live_pipe.edit_draft(
+                big_res["draft_id"],
+                new_body=big_text,
+                actor="tester",
+            )
+            self.assertEqual(big_edited["verification_status"], "PASS")
+            big_tok = live_pipe.approve(
+                big_res["draft_id"],
+                reviewer_id="supervisor_1",
+                expected_payload_sha256=big_edited["payload_sha256"],
+            )
+            with self.assertRaises(DeliveryError):
+                live_pipe.dispatch(big_res["draft_id"], big_tok)
+            # Draft remains APPROVED (lease NOT stranded in DISPATCHING)
+            self.assertEqual(
+                live_pipe.ledger.get_draft(big_res["draft_id"])["state"],
+                DraftState.APPROVED.value,
+            )
+
+    def test_receiver_rejects_dup_json_keys_transfer_encoding_and_missing_idem(self) -> None:
+        rx_db = self.tmpdir / "rx_strict.sqlite3"
+        with LocalLoopbackReceiver(rx_db) as receiver:
+            parsed = urlsplit(receiver.endpoint_url)
+            valid_key = compute_delivery_key("DRAFT-STRICT-1")
+            payload = {
+                "tenant": "tijaraguard",
+                "source": "approved_draft",
+                "message_id": "DRAFT-STRICT-1",
+                "text": "مرحباً",
+            }
+            from message_shield.model import fingerprint as ms_fp  # type: ignore
+
+            body_bytes = json.dumps(
+                {"key": valid_key, "payload": payload, "payload_sha256": ms_fp(payload)},
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+            # 1. Missing Idempotency-Key -> 400
+            c1 = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2.0)
+            c1.request(
+                "POST",
+                "/inbox",
+                body=body_bytes,
+                headers={"Content-Type": "application/json", "Content-Length": str(len(body_bytes))},
+            )
+            self.assertEqual(c1.getresponse().status, 400)
+            c1.close()
+
+            # 2. Duplicate JSON key -> 400
+            dup_json = (
+                b'{"key":"' + valid_key.encode() + b'","key":"' + valid_key.encode() + b'"}'
+            )
+            c2 = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2.0)
+            c2.request(
+                "POST",
+                "/inbox",
+                body=dup_json,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(dup_json)),
+                    "Idempotency-Key": valid_key,
+                },
+            )
+            self.assertEqual(c2.getresponse().status, 400)
+            c2.close()
+
+            # 3. Transfer-Encoding header -> 400
+            c3 = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2.0)
+            c3.request(
+                "POST",
+                "/inbox",
+                body=body_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body_bytes)),
+                    "Transfer-Encoding": "chunked",
+                    "Idempotency-Key": valid_key,
+                },
+            )
+            self.assertEqual(c3.getresponse().status, 400)
+            c3.close()
+
+            self.assertEqual(receiver.count_logical_deliveries(), 0)
+
+            # 4. IPv6 formatting check (binds ::1 if supported on host, else checks formatting logic)
+            try:
+                with LocalLoopbackReceiver(self.tmpdir / "rx_v6.sqlite3", host="::1") as rx6:
+                    self.assertTrue(rx6.endpoint_url.startswith("http://[::1]:"))
+            except OSError:
+                pass

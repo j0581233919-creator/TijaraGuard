@@ -2,18 +2,24 @@
 test_cli_subcommands_via_subprocess (test_e2e_pipeline.TestE2EPipelineAndCLI.test_cli_subcommands_via_subprocess) ... ok
 test_full_demo_runs_and_passes_all_assertions (test_e2e_pipeline.TestE2EPipelineAndCLI.test_full_demo_runs_and_passes_all_assertions) ... ok
 test_malformed_inputs_fail_cleanly (test_e2e_pipeline.TestE2EPipelineAndCLI.test_malformed_inputs_fail_cleanly) ... ok
+test_invalid_masking_policy_and_pseudonymize_residual_checks (test_gate1_privacy.TestGate1Privacy.test_invalid_masking_policy_and_pseudonymize_residual_checks) ... ok
 test_luhn_invalid_saudi_id_not_flagged_as_national_id (test_gate1_privacy.TestGate1Privacy.test_luhn_invalid_saudi_id_not_flagged_as_national_id) ... ok
 test_pseudonymize_hash_fails_closed_without_salt (test_gate1_privacy.TestGate1Privacy.test_pseudonymize_hash_fails_closed_without_salt) ... ok
 test_redacts_saudi_id_iqama_iban_and_phones (test_gate1_privacy.TestGate1Privacy.test_redacts_saudi_id_iqama_iban_and_phones) ... ok
+test_requested_sku_with_pii_rejected_without_persistence (test_gate1_privacy.TestGate1Privacy.test_requested_sku_with_pii_rejected_without_persistence) ... ok
 test_zero_raw_pii_in_sqlite_logs_and_exceptions (test_gate1_privacy.TestGate1Privacy.test_zero_raw_pii_in_sqlite_logs_and_exceptions) ... ok
 test_adversarial_llm_expired_discount_claim_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_expired_discount_claim_blocked) ... ok
 test_adversarial_llm_out_of_stock_claimed_available_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_out_of_stock_claimed_available_blocked) ... ok
 test_adversarial_llm_pii_leak_in_draft_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_pii_leak_in_draft_blocked) ... ok
 test_adversarial_llm_wrong_price_and_unapproved_warranty_blocked (test_gate2_commerce.TestGate2Commerce.test_adversarial_llm_wrong_price_and_unapproved_warranty_blocked) ... ok
 test_arabic_dialect_inquiry_with_redacted_pii_resolves_sku_and_passes (test_gate2_commerce.TestGate2Commerce.test_arabic_dialect_inquiry_with_redacted_pii_resolves_sku_and_passes) ... ok
+test_edit_draft_pii_injection_never_persists_raw_pii (test_gate2_commerce.TestGate2Commerce.test_edit_draft_pii_injection_never_persists_raw_pii) ... ok
 test_missing_or_false_string_consent_or_missing_evidence_blocked (test_gate2_commerce.TestGate2Commerce.test_missing_or_false_string_consent_or_missing_evidence_blocked) ... ok
+test_consent_and_channel_tamper_and_non_ascii_mac_invalidated (test_gate3_approval.TestGate3Approval.test_consent_and_channel_tamper_and_non_ascii_mac_invalidated) ... ok
+test_delivery_state_machine_blocks_illegal_transitions_and_operator_pii_redacted (test_gate3_approval.TestGate3Approval.test_delivery_state_machine_blocks_illegal_transitions_and_operator_pii_redacted) ... ok
 test_expired_lease_rejected_and_audit_triggers_immutable (test_gate3_approval.TestGate3Approval.test_expired_lease_rejected_and_audit_triggers_immutable) ... ok
 test_payload_edit_or_direct_sqlite_tamper_invalidates_approval (test_gate3_approval.TestGate3Approval.test_payload_edit_or_direct_sqlite_tamper_invalidates_approval) ... ok
+test_readonly_verify_audit_detects_dropped_trigger_tail_delete_non_ascii_and_wrong_db (test_gate3_approval.TestGate3Approval.test_readonly_verify_audit_detects_dropped_trigger_tail_delete_non_ascii_and_wrong_db) ... ok
 test_shadow_mode_is_default_and_never_sends_externally (test_gate3_approval.TestGate3Approval.test_shadow_mode_is_default_and_never_sends_externally) ... ok
 test_single_use_lease_blocks_replay_and_concurrent_threads (test_gate3_approval.TestGate3Approval.test_single_use_lease_blocks_replay_and_concurrent_threads) ... ok
 test_unapproved_or_wrong_hash_or_malformed_mac_rejected (test_gate3_approval.TestGate3Approval.test_unapproved_or_wrong_hash_or_malformed_mac_rejected) ... ok
@@ -22,9 +28,11 @@ test_duplicate_http_and_concurrent_retries_produce_one_logical_inbox_row (test_g
 test_lost_ack_enters_unknown_and_recovers_single_logical_delivery (test_gate4_delivery.TestGate4Delivery.test_lost_ack_enters_unknown_and_recovers_single_logical_delivery) ... ok
 test_non_loopback_endpoint_rejected (test_gate4_delivery.TestGate4Delivery.test_non_loopback_endpoint_rejected) ... ok
 test_process_sigkill_during_sending_recovers_after_lease_expiry (test_gate4_delivery.TestGate4Delivery.test_process_sigkill_during_sending_recovers_after_lease_expiry) ... ok
+test_receiver_rejects_dup_json_keys_transfer_encoding_and_missing_idem (test_gate4_delivery.TestGate4Delivery.test_receiver_rejects_dup_json_keys_transfer_encoding_and_missing_idem) ... ok
+test_shadow_mode_blocks_recover_oversized_preserves_lease_and_deliv_idempotent (test_gate4_delivery.TestGate4Delivery.test_shadow_mode_blocks_recover_oversized_preserves_lease_and_deliv_idempotent) ... ok
 
 ----------------------------------------------------------------------
-Ran 23 tests in 45.008s
+Ran 31 tests in 56.499s
 
 OK
 
@@ -68,7 +76,7 @@ OK
     }
   },
   "scenario_a_shadow": {
-    "draft_id": "DRAFT-5ACE1F41",
+    "draft_id": "DRAFT-E933D799",
     "detected_dialect": "GULF",
     "resolved_sku": "SONY-WH1000XM5",
     "pii_entity_count": 2,
@@ -78,24 +86,24 @@ OK
     "dispatched_externally": false
   },
   "scenario_b_adversarial_llm": {
-    "draft_id": "DRAFT-B204988B",
+    "draft_id": "DRAFT-80198112",
     "verification_status": "FAIL",
     "ledger_state": "VERIFIED_BLOCKED",
     "reason_count": 4
   },
   "scenario_c_payload_tamper": {
-    "draft_id": "DRAFT-645304F6",
+    "draft_id": "DRAFT-72DD0320",
     "tampered_dispatch_rejected": true,
     "final_ledger_state": "VERIFIED_BLOCKED"
   },
   "scenario_d_lost_ack_recovery": {
-    "draft_id": "DRAFT-31005BC9",
+    "draft_id": "DRAFT-2EF763C8",
     "initial_state_after_drop_ack": "UNKNOWN_DELIVERY",
     "initial_shield_state": "UNKNOWN",
     "recovered_state": "DELIVERED",
     "recovered_shield_state": "DELIVERED",
-    "receipt_id": "rcpt-5255b81ac35e4938",
-    "delivery_key": "dc68a1057ac7afd4b84a99d8f9df5d162b9ca6bded0d30b3433d7cd6cf51e5ca",
+    "receipt_id": "rcpt-808df71783404044",
+    "delivery_key": "8031a1e7dfc81c35f47a9bfb36d88d49625e06d0e1fe293e362c514bccc18119",
     "receiver_logical_inbox_rows": 1,
     "receiver_post_attempts": 1
   },

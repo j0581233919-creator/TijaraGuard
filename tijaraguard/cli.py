@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import secrets
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -13,7 +12,7 @@ sys.dont_write_bytecode = True
 
 from .demo import run_demo
 from .deps import inspect_dependencies
-from .ledger import ApprovalLedger
+from .ledger import verify_audit_database_readonly
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,14 +73,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not db_path.exists():
             print(json.dumps({"valid": False, "error": f"Database not found: {db_path}"}))
             return 1
-        ledger = ApprovalLedger(db_path, approval_secret=secrets.token_bytes(32))
-        valid, errors = ledger.verify_audit_chain()
-        events = ledger.list_audit_events()
+        valid, event_count, errors = verify_audit_database_readonly(db_path)
         print(
             json.dumps(
                 {
                     "ledger_db": str(db_path),
-                    "event_count": len(events),
+                    "event_count": event_count,
                     "valid": valid,
                     "errors": errors,
                 },

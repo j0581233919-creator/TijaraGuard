@@ -20,13 +20,14 @@ from tijaraguard.models import DraftState, ExecutionMode, VerificationBlockedErr
 from tijaraguard.pipeline import TijaraGuardPipeline
 
 from helpers import (
-    FIXED_REFERENCE_TIME,
+    ALL_SYNTH_PII_SECRETS,
     REPO_ROOT,
     SYNTH_GCC_IBAN,
     SYNTH_SAUDI_ID,
     load_test_catalog,
     make_inbound_message,
     make_secret_bytes,
+    scan_sqlite_for_secrets,
 )
 
 
@@ -120,12 +121,39 @@ class TestGate2Commerce(unittest.TestCase):
         )
 
         def leaky_llm(base: str, _ctx: Dict[str, Any]) -> str:
-            return f"{base}\n(مرجع الهوية: {SYNTH_SAUDI_ID})"
+            return f"{base}\n(مرجع الهوية: {SYNTH_SAUDI_ID} والايبان {SYNTH_GCC_IBAN})"
 
         res = self.pipe.process_inbound(msg, custom_llm_callable=leaky_llm)
         self.assertEqual(res["verification_status"], "FAIL")
         self.assertEqual(res["state"], DraftState.VERIFIED_BLOCKED.value)
         self.assertTrue(any("PRIVACY_LEAK_IN_DRAFT" in r for r in res["reasons"]))
+        self.assertNotIn(SYNTH_SAUDI_ID, res["draft_body"])
+        self.assertNotIn(SYNTH_GCC_IBAN, res["draft_body"])
+        self.assertEqual(
+            scan_sqlite_for_secrets(self.tmpdir / "ledger.sqlite3", ALL_SYNTH_PII_SECRETS),
+            [],
+        )
+
+    def test_edit_draft_pii_injection_never_persists_raw_pii(self) -> None:
+        msg = make_inbound_message(
+            message_id="msg-g2-edit-pii",
+            raw_text="كم سعر ماكينة قهوة ديلونجي EC685؟",
+            requested_sku="DELONGHI-EC685",
+        )
+        res = self.pipe.process_inbound(msg)
+        self.assertEqual(res["verification_status"], "PASS")
+
+        edited = self.pipe.edit_draft(
+            res["draft_id"],
+            new_body=f"مرحباً، سعر ماكينة قهوة ديلونجي EC685 هو 850.00 SAR (ايبان {SYNTH_GCC_IBAN} وهوية {SYNTH_SAUDI_ID})",
+            actor="malicious_editor",
+        )
+        self.assertEqual(edited["verification_status"], "FAIL")
+        self.assertEqual(edited["state"], DraftState.VERIFIED_BLOCKED.value)
+        self.assertEqual(
+            scan_sqlite_for_secrets(self.tmpdir / "ledger.sqlite3", ALL_SYNTH_PII_SECRETS),
+            [],
+        )
 
     def test_missing_or_false_string_consent_or_missing_evidence_blocked(self) -> None:
         for idx, (consent, evidence) in enumerate(

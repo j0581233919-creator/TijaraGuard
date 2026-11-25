@@ -182,6 +182,8 @@ class InboundMessage:
             if not isinstance(self.requested_sku, str):
                 raise MalformedInputError("Field 'requested_sku' must be a string or None.")
             sku = self.requested_sku.strip().upper()
+            if sku:
+                validate_safe_id(sku, "requested_sku")
             object.__setattr__(self, "requested_sku", sku or None)
 
 

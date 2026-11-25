@@ -74,6 +74,8 @@ class PrivacyGate:
         contact_hash_key: Optional[bytes] = None,
         min_confidence: float = 0.5,
     ) -> None:
+        if not isinstance(policy, MaskingPolicy):
+            raise MalformedInputError("policy must be a valid MaskingPolicy enum value.")
         self.policy = policy
         self.min_confidence = float(min_confidence)
         self.engine = RegionalPIIEngine()
@@ -90,6 +92,39 @@ class PrivacyGate:
         if self.policy == MaskingPolicy.PSEUDONYMIZE_HASH:
             self.redactor._resolve_effective_salt(salt)
 
+    def _assert_clean_after_redaction(self, redacted_text: str, field_name: str) -> None:
+        if self.policy in (MaskingPolicy.REDACT_FULL, MaskingPolicy.PSEUDONYMIZE_HASH):
+            residual = self.verify_text_clean(redacted_text)
+            if residual:
+                raise PrivacyViolationError(
+                    f"Residual PII categories remain in '{field_name}' after {self.policy.value}: {residual}"
+                )
+
+    def redact_text_full(self, text: str) -> str:
+        """Deterministically redacts any supported PII in arbitrary text using REDACT_FULL."""
+        if not isinstance(text, str) or not text.strip():
+            return text
+        res = self.redactor.redact(
+            text,
+            policy=MaskingPolicy.REDACT_FULL,
+            min_confidence=self.min_confidence,
+        )
+        if self.verify_text_clean(res.redacted_text):
+            return "[REDACTED_PII_CONTENT]"
+        return res.redacted_text
+
+    def redact_structure(self, value: Any) -> Any:
+        """Recursively redacts all strings within nested dicts/lists/tuples."""
+        if isinstance(value, str):
+            return self.redact_text_full(value)
+        if isinstance(value, list):
+            return [self.redact_structure(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.redact_structure(item) for item in value)
+        if isinstance(value, dict):
+            return {k: self.redact_structure(v) for k, v in value.items()}
+        return value
+
     def redact_text(self, text: str) -> Tuple[str, Dict[str, Any]]:
         """Redacts PII from text and returns (redacted_text, zero_raw_pii_metadata)."""
         if not isinstance(text, str) or not text.strip():
@@ -101,12 +136,7 @@ class PrivacyGate:
             salt=self._salt,
         )
         metadata = _scrub_redaction_metadata(result.to_dict(include_raw_spans=False))
-        if self.policy == MaskingPolicy.REDACT_FULL:
-            residual = self.verify_text_clean(result.redacted_text)
-            if residual:
-                raise PrivacyViolationError(
-                    f"Residual PII categories remain after REDACT_FULL: {residual}"
-                )
+        self._assert_clean_after_redaction(result.redacted_text, "raw_text")
         return result.redacted_text, metadata
 
     def verify_text_clean(self, text: str) -> List[str]:
@@ -130,6 +160,11 @@ class PrivacyGate:
         if not isinstance(msg, InboundMessage):
             raise MalformedInputError("Expected InboundMessage instance.")
 
+        if msg.requested_sku and self.verify_text_clean(msg.requested_sku):
+            raise PrivacyViolationError(
+                "Supported PII detected in requested_sku; rejected before persistence."
+            )
+
         redacted_text, text_meta = self.redact_text(msg.raw_text)
 
         handle_res = self.redactor.redact(
@@ -138,8 +173,7 @@ class PrivacyGate:
             min_confidence=self.min_confidence,
             salt=self._salt,
         )
-        if self.policy == MaskingPolicy.REDACT_FULL and self.verify_text_clean(handle_res.redacted_text):
-            raise PrivacyViolationError("Residual PII detected in customer_handle after redaction.")
+        self._assert_clean_after_redaction(handle_res.redacted_text, "customer_handle")
 
         evidence_redacted = ""
         evidence_entities: List[str] = []
@@ -152,6 +186,7 @@ class PrivacyGate:
             )
             evidence_redacted = ev_res.redacted_text
             evidence_entities = sorted({s.entity_type.value for s in ev_res.entities_detected})
+            self._assert_clean_after_redaction(evidence_redacted, "consent_evidence")
 
         contact_ref = self.opaque_contact_ref(msg.raw_contact_target)
 

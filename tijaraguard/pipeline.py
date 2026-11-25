@@ -10,12 +10,17 @@ from .commerce import CommercialGate
 from .delivery import MessageShieldDeliveryAdapter
 from .ledger import ApprovalLedger
 from .models import (
+    ApprovalRequiredError,
     ApprovalToken,
+    CommercialEvaluation,
+    DeliveryError,
     DispatchOutcome,
     DraftState,
     ExecutionMode,
     InboundMessage,
     MalformedInputError,
+    PrivacyViolationError,
+    canonical_json,
 )
 from .privacy import MaskingPolicy, PrivacyGate
 
@@ -58,16 +63,31 @@ class TijaraGuardPipeline:
         )
 
         self.delivery: Optional[MessageShieldDeliveryAdapter] = None
-        if outbox_db_path is not None and receiver_endpoint is not None:
+        if mode == ExecutionMode.LOOPBACK_LIVE:
+            if outbox_db_path is None or receiver_endpoint is None:
+                raise MalformedInputError(
+                    "LOOPBACK_LIVE mode requires both outbox_db_path and receiver_endpoint."
+                )
             self.delivery = MessageShieldDeliveryAdapter(
                 outbox_db_path=outbox_db_path,
                 endpoint_url=receiver_endpoint,
                 timeout=shield_timeout,
             )
-        elif mode == ExecutionMode.LOOPBACK_LIVE:
-            raise MalformedInputError(
-                "LOOPBACK_LIVE mode requires both outbox_db_path and receiver_endpoint."
-            )
+
+    def _assert_evaluation_pii_clean(self, evaluation: CommercialEvaluation) -> None:
+        checks = [
+            ("body", evaluation.body),
+            ("subject", evaluation.subject),
+            ("sku", evaluation.sku or ""),
+            ("reasons", canonical_json(evaluation.reasons)),
+            ("verification_report", canonical_json(evaluation.verification_report_dict)),
+        ]
+        for field_name, content in checks:
+            leaked = self.privacy_gate.verify_text_clean(content)
+            if leaked:
+                raise PrivacyViolationError(
+                    f"Gate 2 evaluation retained PII in '{field_name}': {leaked}"
+                )
 
     def process_inbound(
         self,
@@ -88,6 +108,7 @@ class TijaraGuardPipeline:
             envelope,
             custom_llm_callable=custom_llm_callable,
         )
+        self._assert_evaluation_pii_clean(evaluation)
         logger.info(
             "gate2_verified draft_id=%s sku=%s status=%s",
             evaluation.draft_id,
@@ -123,11 +144,12 @@ class TijaraGuardPipeline:
         ttl_seconds: int = 900,
     ) -> ApprovalToken:
         """Issues a cryptographic single-use human approval lease for a verified draft."""
+        safe_notes = self.privacy_gate.redact_text_full(notes)
         token = self.ledger.approve_draft(
             draft_id=draft_id,
             reviewer_id=reviewer_id,
             expected_payload_sha256=expected_payload_sha256,
-            notes=notes,
+            notes=safe_notes,
             ttl_seconds=ttl_seconds,
         )
         logger.info(
@@ -140,7 +162,8 @@ class TijaraGuardPipeline:
 
     def reject(self, draft_id: str, *, reviewer_id: str, reason: str) -> Dict[str, Any]:
         """Rejects a pending or approved draft and revokes any active lease."""
-        row = self.ledger.reject_draft(draft_id, reviewer_id=reviewer_id, reason=reason)
+        safe_reason = self.privacy_gate.redact_text_full(reason)
+        row = self.ledger.reject_draft(draft_id, reviewer_id=reviewer_id, reason=safe_reason)
         logger.info("gate3_rejected draft_id=%s reviewer=%s", draft_id, reviewer_id)
         return row
 
@@ -151,6 +174,7 @@ class TijaraGuardPipeline:
             draft_row=draft_row,
             new_body=new_body,
         )
+        self._assert_evaluation_pii_clean(evaluation)
         updated = self.ledger.edit_draft_body(draft_id, evaluation, actor=actor)
         logger.info(
             "gate3_edited draft_id=%s new_state=%s verification=%s",
@@ -170,6 +194,13 @@ class TijaraGuardPipeline:
         """Atomically consumes approval lease and dispatches in SHADOW or LOOPBACK_LIVE mode."""
         if not isinstance(approval_token, ApprovalToken) or approval_token.draft_id != draft_id:
             raise MalformedInputError("approval_token does not match target draft_id.")
+
+        if self.mode == ExecutionMode.LOOPBACK_LIVE:
+            pre_draft = self.ledger.get_draft(draft_id)
+            if len(pre_draft["body"].encode("utf-8")) > 8192:
+                raise DeliveryError(
+                    "Approved payload exceeds MessageShield 8192-byte limit; lease preserved."
+                )
 
         consumed_draft = self.ledger.consume_approval_for_dispatch(
             draft_id=draft_id,
@@ -191,7 +222,18 @@ class TijaraGuardPipeline:
         if self.delivery is None:
             raise MalformedInputError("Delivery adapter is not configured.")
 
-        shield_state = self.delivery.admit_and_send(draft_id, consumed_draft["body"])
+        try:
+            shield_state = self.delivery.admit_and_send(draft_id, consumed_draft["body"])
+            if shield_state["state"] == "PENDING":
+                shield_state = self.delivery.drain(draft_id)
+        except DeliveryError:
+            self.ledger.record_delivery_state(
+                draft_id,
+                DraftState.FAILED_DELIVERY,
+                details={"reason": "delivery_error"},
+            )
+            raise
+
         delivery_key = shield_state["key"]
         receipt_id = shield_state.get("receipt_id")
         ms_status = shield_state["state"]
@@ -273,25 +315,48 @@ class TijaraGuardPipeline:
         confirm_delivered: bool = True,
     ) -> DispatchOutcome:
         """Recovers an UNKNOWN or interrupted send via read-only GET receipt lookup."""
-        if self.delivery is None:
-            raise MalformedInputError("Delivery adapter is not configured.")
+        if self.mode != ExecutionMode.LOOPBACK_LIVE or self.delivery is None:
+            raise DeliveryError("Delivery recovery is only available in LOOPBACK_LIVE mode.")
+
+        current = self.ledger.get_draft(draft_id)
+        if current["state"] == DraftState.DELIVERED.value:
+            return DispatchOutcome(
+                draft_id=draft_id,
+                mode=self.mode.value,
+                state=DraftState.DELIVERED.value,
+                dispatched=True,
+                delivery_key=current["delivery_key"],
+                receipt_id=current["receipt_id"],
+                message_shield_state="DELIVERED",
+                reason="Already delivered.",
+            )
+        if current["state"] not in (
+            DraftState.DISPATCHING.value,
+            DraftState.UNKNOWN_DELIVERY.value,
+            DraftState.ACCEPTED_DELIVERY.value,
+        ):
+            raise ApprovalRequiredError(
+                f"Draft '{draft_id}' in state '{current['state']}' is not eligible for recovery."
+            )
 
         shield_state = self.delivery.recover(draft_id)
         ms_status = shield_state["state"]
         delivery_key = shield_state["key"]
         receipt_id = shield_state.get("receipt_id")
 
-        if ms_status == "ACCEPTED" and receipt_id:
-            self.ledger.record_delivery_state(
-                draft_id,
-                DraftState.ACCEPTED_DELIVERY,
-                delivery_key=delivery_key,
-                receipt_id=receipt_id,
-                details={"recovered_via": "read_only_receipt_lookup"},
-            )
+        if ms_status in ("ACCEPTED", "DELIVERED") and receipt_id:
+            if current["state"] in (DraftState.DISPATCHING.value, DraftState.UNKNOWN_DELIVERY.value):
+                self.ledger.record_delivery_state(
+                    draft_id,
+                    DraftState.ACCEPTED_DELIVERY,
+                    delivery_key=delivery_key,
+                    receipt_id=receipt_id,
+                    details={"recovered_via": "read_only_receipt_lookup"},
+                )
             if confirm_delivered:
-                delivered_state = self.delivery.confirm_delivered(draft_id, receipt_id)
-                ms_status = delivered_state["state"]
+                if ms_status != "DELIVERED":
+                    delivered_state = self.delivery.confirm_delivered(draft_id, receipt_id)
+                    ms_status = delivered_state["state"]
                 updated = self.ledger.record_delivery_state(
                     draft_id,
                     DraftState.DELIVERED,
@@ -320,8 +385,28 @@ class TijaraGuardPipeline:
                 reason="Recovered receipt without resending POST.",
             )
 
-        current = self.ledger.get_draft(draft_id)
-        if ms_status == "UNKNOWN" and current["state"] != DraftState.UNKNOWN_DELIVERY.value:
+        if ms_status == "FAILED":
+            updated = self.ledger.record_delivery_state(
+                draft_id,
+                DraftState.FAILED_DELIVERY,
+                delivery_key=delivery_key,
+                details={"reason": shield_state.get("error") or "outbox_failed"},
+            )
+            return DispatchOutcome(
+                draft_id=draft_id,
+                mode=self.mode.value,
+                state=updated["state"],
+                dispatched=False,
+                delivery_key=delivery_key,
+                receipt_id=receipt_id,
+                message_shield_state=ms_status,
+                reason=shield_state.get("error") or "Delivery failed permanently.",
+            )
+
+        if (
+            ms_status == "UNKNOWN"
+            and current["state"] == DraftState.DISPATCHING.value
+        ):
             self.ledger.record_delivery_state(
                 draft_id,
                 DraftState.UNKNOWN_DELIVERY,

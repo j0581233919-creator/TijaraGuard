@@ -142,6 +142,16 @@ class MessageShieldDeliveryAdapter:
         except (ValueError, MessageShieldMissing, MessageShieldConflict) as exc:
             raise DeliveryError(f"MessageShield recovery failed: {exc}") from exc
 
+    def drain(self, draft_id: str) -> Dict[str, Any]:
+        """Executes bounded MessageShield pre-request connection retries."""
+        tenant, source, msg_id = build_shield_identity(
+            draft_id, tenant=self.tenant, source=self.source
+        )
+        try:
+            return self.shield.drain(tenant, source, msg_id)
+        except (ValueError, MessageShieldMissing, MessageShieldConflict) as exc:
+            raise DeliveryError(f"MessageShield drain failed: {exc}") from exc
+
     def confirm_delivered(self, draft_id: str, receipt_id: str) -> Dict[str, Any]:
         """Records DELIVERED confirmation against the verified gateway receipt_id."""
         tenant, source, msg_id = build_shield_identity(
@@ -161,6 +171,22 @@ class MessageShieldDeliveryAdapter:
             return self.shield.get(tenant, source, msg_id)
         except (ValueError, MessageShieldMissing) as exc:
             raise DeliveryError(f"MessageShield lookup failed: {exc}") from exc
+
+
+def _no_duplicate_json_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    obj: Dict[str, Any] = {}
+    for key, val in pairs:
+        if key in obj:
+            raise ValueError("Duplicate JSON key")
+        obj[key] = val
+    return obj
+
+
+def _parse_json_no_duplicate_keys(raw_bytes: bytes) -> Any:
+    return json.loads(
+        raw_bytes.decode("utf-8"),
+        object_pairs_hook=_no_duplicate_json_keys,
+    )
 
 
 class LocalLoopbackReceiver:
@@ -235,7 +261,8 @@ class LocalLoopbackReceiver:
         """Returns the bound loopback HTTP endpoint URL."""
         if self._server is None:
             raise DeliveryError("LocalLoopbackReceiver is not started.")
-        return f"http://{self.host}:{self._server.server_port}/inbox"
+        host_fmt = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host_fmt}:{self._server.server_port}/inbox"
 
     def start(self) -> "LocalLoopbackReceiver":
         """Starts the loopback HTTP server on a background daemon thread."""
@@ -245,6 +272,10 @@ class LocalLoopbackReceiver:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                super().setup()
+                self.connection.settimeout(3.0)
 
             def log_message(self, format: str, *args: Any) -> None:
                 # Never write HTTP logs that might echo payload metadata.
@@ -270,14 +301,23 @@ class LocalLoopbackReceiver:
 
                 conn = None
                 try:
-                    raw_len = self.headers.get("Content-Length")
-                    if raw_len is None or not raw_len.isdigit():
+                    if self.headers.get_all("Transfer-Encoding"):
+                        raise ValueError("Transfer-Encoding is not supported")
+                    cl_headers = self.headers.get_all("Content-Length") or []
+                    if len(cl_headers) != 1:
+                        raise ValueError("Single Content-Length header required")
+                    raw_len = cl_headers[0].strip()
+                    if not raw_len or not raw_len.isascii() or not raw_len.isdigit():
                         raise ValueError("Missing or invalid Content-Length")
                     length = int(raw_len)
                     if length <= 0 or length > 16384:
                         raise ValueError("Body length out of bounds")
+                    if self.headers.get_content_type() != "application/json":
+                        raise ValueError("Content-Type must be application/json")
                     raw_body = self.rfile.read(length)
-                    data = json.loads(raw_body.decode("utf-8"))
+                    if len(raw_body) != length:
+                        raise ValueError("Incomplete request body")
+                    data = _parse_json_no_duplicate_keys(raw_body)
                     if not isinstance(data, dict) or set(data) != {"key", "payload", "payload_sha256"}:
                         raise ValueError("Invalid gateway envelope")
                     payload = data["payload"]
@@ -300,9 +340,9 @@ class LocalLoopbackReceiver:
                     ):
                         raise ValueError("Gateway identity mismatch")
 
-                    header_idem = self.headers.get("Idempotency-Key")
-                    if header_idem is not None and header_idem != data["key"]:
-                        raise ValueError("Idempotency-Key mismatch")
+                    idem_headers = self.headers.get_all("Idempotency-Key") or []
+                    if len(idem_headers) != 1 or idem_headers[0] != data["key"]:
+                        raise ValueError("Missing or mismatched Idempotency-Key")
 
                     canon_payload = ms_canonical(payload)
                     payload_hash = ms_fingerprint(payload)
@@ -402,6 +442,7 @@ class LocalLoopbackReceiver:
 
         class LoopbackHTTPServer(ThreadingHTTPServer):
             allow_reuse_address = True
+            address_family = socket.AF_INET6 if self.host == "::1" else socket.AF_INET
 
         self._server = LoopbackHTTPServer((self.host, self.port), Handler)
         self._thread = threading.Thread(

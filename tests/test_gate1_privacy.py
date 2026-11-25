@@ -15,7 +15,7 @@ for _p in (str(_TESTS_DIR), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tijaraguard.models import ExecutionMode, InboundMessage, MalformedInputError
+from tijaraguard.models import ExecutionMode, InboundMessage, MalformedInputError, PrivacyViolationError
 from tijaraguard.pipeline import TijaraGuardPipeline
 from tijaraguard.privacy import EntityType, MaskingPolicy, PrivacyGate
 
@@ -145,3 +145,55 @@ class TestGate1Privacy(unittest.TestCase):
             [],
         )
         self.assertTrue(pipe.audit_zero_pii(ALL_SYNTH_PII_SECRETS)["clean"])
+
+    def test_requested_sku_with_pii_rejected_without_persistence(self) -> None:
+        ledger_db = self.tmpdir / "ledger_sku_pii.sqlite3"
+        pipe = TijaraGuardPipeline(
+            catalog=load_test_catalog(),
+            ledger_db_path=ledger_db,
+            approval_secret=make_secret_bytes(),
+            contact_hash_key=make_secret_bytes(),
+            mode=ExecutionMode.SHADOW,
+        )
+        with capture_tijaraguard_logs() as log_buf:
+            for bad_sku in (SYNTH_GCC_IBAN, SYNTH_SAUDI_ID):
+                msg = make_inbound_message(
+                    message_id=f"msg-sku-{bad_sku[:6]}",
+                    raw_text="كم سعر سماعة سوني؟",
+                    requested_sku=bad_sku,
+                )
+                with self.assertRaises(PrivacyViolationError):
+                    pipe.process_inbound(msg)
+
+            # Non-identifier ASCII/whitespace injection in requested_sku rejected cleanly
+            with self.assertRaises(MalformedInputError):
+                make_inbound_message(
+                    message_id="msg-sku-space",
+                    raw_text="كم سعر سماعة سوني؟",
+                    requested_sku="SKU WITH SPACE",
+                )
+
+        logs_text = log_buf.getvalue()
+        for secret_val in (SYNTH_GCC_IBAN, SYNTH_SAUDI_ID):
+            self.assertNotIn(secret_val, logs_text)
+        self.assertEqual(scan_sqlite_for_secrets(ledger_db, ALL_SYNTH_PII_SECRETS), [])
+
+    def test_invalid_masking_policy_and_pseudonymize_residual_checks(self) -> None:
+        with self.assertRaises(MalformedInputError):
+            PrivacyGate(policy="REDACT_FULL", contact_hash_key=make_secret_bytes())
+
+        gate = PrivacyGate(
+            policy=MaskingPolicy.PSEUDONYMIZE_HASH,
+            salt="salt-2026-test",
+            contact_hash_key=make_secret_bytes(),
+        )
+        msg = make_inbound_message(
+            message_id="msg-pseudo-01",
+            customer_handle=f"عميل {SYNTH_SAUDI_ID}",
+            consent_evidence=f"opt_in: {SYNTH_GCC_IBAN}",
+            raw_text=f"استفسار رقم {SYNTH_PHONE_INTL}",
+        )
+        env = gate.sanitize_inbound(msg)
+        self.assertNotIn(SYNTH_SAUDI_ID, env.customer_handle)
+        self.assertNotIn(SYNTH_GCC_IBAN, env.consent_evidence)
+        self.assertNotIn(SYNTH_PHONE_INTL, env.redacted_text)

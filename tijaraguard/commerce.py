@@ -7,7 +7,7 @@ import re
 from typing import Any, Callable, Dict, Optional
 
 from .deps import load_dependencies
-from .models import CommercialEvaluation, MalformedInputError, RedactedEnvelope
+from .models import CommercialEvaluation, MalformedInputError, RedactedEnvelope, canonical_json
 from .privacy import PrivacyGate, strip_redaction_markers
 
 _DEPS = load_dependencies()
@@ -131,28 +131,33 @@ class CommercialGate:
             custom_llm_callable=custom_llm_callable,
         )
 
-        report: VerificationReport = self.verifier.verify(
-            lead=lead,
-            catalog=self.catalog,
-            draft_text=draft.body,
-            target_sku=draft.sku,
-        )
-
+        # Reuse DraftGenerator's deterministic verification report without redundant re-run.
+        report: VerificationReport = draft.verification_report
         report_dict = report.to_dict()
         status = report.status.value
         reasons = list(report.reasons)
-        checks = list(report_dict["checks"])
+        final_subject = draft.subject
+        final_body = draft.body
 
-        # Defense-in-depth: ensure simulated LLM did not inject supported PII into draft text.
+        # Defense-in-depth: ensure simulated LLM never persists raw PII into body, subject, or report.
         if self.privacy_gate is not None:
-            leaked_in_body = self.privacy_gate.verify_text_clean(draft.body)
-            leaked_in_subject = self.privacy_gate.verify_text_clean(draft.subject)
-            leaked_types = sorted(set(leaked_in_body + leaked_in_subject))
+            leaked_in_body = self.privacy_gate.verify_text_clean(final_body)
+            leaked_in_subject = self.privacy_gate.verify_text_clean(final_subject)
+            leaked_in_report = self.privacy_gate.verify_text_clean(canonical_json(report_dict))
+            leaked_types = sorted(set(leaked_in_body + leaked_in_subject + leaked_in_report))
             if leaked_types:
+                final_body = self.privacy_gate.redact_text_full(final_body)
+                final_subject = self.privacy_gate.redact_text_full(final_subject)
+                report_dict = self.privacy_gate.redact_structure(report_dict)
+                reasons = [self.privacy_gate.redact_text_full(r) for r in reasons]
                 status = VerificationStatus.FAIL.value
-                reasons.append(f"PRIVACY_LEAK_IN_DRAFT: {leaked_types}")
+                leak_note = f"PRIVACY_LEAK_IN_DRAFT: {leaked_types}"
+                if leak_note not in reasons:
+                    reasons.append(leak_note)
                 report_dict["status"] = status
-                report_dict["reasons"] = reasons
+                report_dict["reasons"] = list(reasons)
+
+        checks = list(report_dict["checks"])
 
         # Preserve explicit inquiry/resolution metadata cleanly.
         fuzzy_note = draft.fuzzy_match_notes or resolution_notes
@@ -168,8 +173,8 @@ class CommercialGate:
             draft_id=draft.draft_id,
             sku=draft.sku,
             language=draft.language,
-            subject=draft.subject,
-            body=draft.body,
+            subject=final_subject,
+            body=final_body,
             verification_status=status,
             reasons=reasons,
             checks=checks,
@@ -211,21 +216,29 @@ class CommercialGate:
         report_dict = report.to_dict()
         status = report.status.value
         reasons = list(report.reasons)
+        final_body = new_body
 
         if self.privacy_gate is not None:
-            leaked_types = self.privacy_gate.verify_text_clean(new_body)
+            leaked_in_body = self.privacy_gate.verify_text_clean(final_body)
+            leaked_in_report = self.privacy_gate.verify_text_clean(canonical_json(report_dict))
+            leaked_types = sorted(set(leaked_in_body + leaked_in_report))
             if leaked_types:
+                final_body = self.privacy_gate.redact_text_full(final_body)
+                report_dict = self.privacy_gate.redact_structure(report_dict)
+                reasons = [self.privacy_gate.redact_text_full(r) for r in reasons]
                 status = VerificationStatus.FAIL.value
-                reasons.append(f"PRIVACY_LEAK_IN_DRAFT: {leaked_types}")
+                leak_note = f"PRIVACY_LEAK_IN_DRAFT: {leaked_types}"
+                if leak_note not in reasons:
+                    reasons.append(leak_note)
                 report_dict["status"] = status
-                report_dict["reasons"] = reasons
+                report_dict["reasons"] = list(reasons)
 
         return CommercialEvaluation(
             draft_id=draft_row["draft_id"],
             sku=draft_row["sku"],
             language=draft_row["language"],
             subject=draft_row["subject"],
-            body=new_body,
+            body=final_body,
             verification_status=status,
             reasons=reasons,
             checks=list(report_dict["checks"]),
