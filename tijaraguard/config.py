@@ -436,7 +436,9 @@ def load_config(
                 extra_headers=dict(pdata.get("extra_headers") or {}),
                 input_cost_per_1k=pdata.get("input_cost_per_1k"),
                 output_cost_per_1k=pdata.get("output_cost_per_1k"),
-                enabled=bool(pdata.get("enabled", True)),
+                enabled=parse_bool_strict(
+                    pdata.get("enabled", True), f"providers.{name}.enabled"
+                ),
             )
 
     builtin_provider_specs = [

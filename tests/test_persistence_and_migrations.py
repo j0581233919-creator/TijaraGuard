@@ -24,7 +24,12 @@ from tijaraguard.ledger import (
     restore_ledger_backup,
     verify_audit_database_readonly,
 )
-from tijaraguard.models import DraftState, ExecutionMode, MalformedInputError
+from tijaraguard.models import (
+    DraftState,
+    ExecutionMode,
+    MalformedInputError,
+    VerificationBlockedError,
+)
 from tijaraguard.pipeline import TijaraGuardPipeline
 
 from helpers import REPO_ROOT, load_test_catalog, make_inbound_message, make_secret_bytes
@@ -275,3 +280,71 @@ class TestPersistenceAndMigrations(unittest.TestCase):
         self.assertIsNone(
             routes.get(tenant_id="tenant_a", channel="whatsapp", contact_ref="ref-1111")
         )
+
+    def test_retention_purge_blocks_consent_bypass_and_upgrades_legacy_routes(self) -> None:
+        pipe = TijaraGuardPipeline(
+            catalog=load_test_catalog(),
+            ledger_db_path=self.tmpdir / "ret_bypass.sqlite3",
+            approval_secret=make_secret_bytes(),
+            contact_hash_key=make_secret_bytes(),
+            mode=ExecutionMode.SHADOW,
+        )
+        blocked = pipe.process_inbound(
+            make_inbound_message(
+                message_id="msg-ret-no-evid",
+                consent_to_contact=True,
+                consent_evidence="",
+                requested_sku="DELONGHI-EC685",
+                raw_text="كم سعر ماكينة قهوة ديلونجي EC685؟",
+            )
+        )
+        self.assertEqual(blocked["state"], DraftState.VERIFIED_BLOCKED.value)
+
+        purge_res = pipe.ledger.purge_expired_retention(now_iso="2099-01-01T00:00:00+00:00")
+        self.assertEqual(purge_res["purged_drafts"], 1)
+        purged_row = pipe.ledger.get_draft(blocked["draft_id"])
+        self.assertEqual(purged_row["consent_evidence"], "")
+        self.assertEqual(purged_row["consent_to_contact"], 0)
+
+        with self.assertRaises(VerificationBlockedError):
+            pipe.edit_draft(
+                blocked["draft_id"],
+                new_body="سعر ماكينة ديلونجي EC685 هو 1899 ريال شامل الضريبة",
+                actor="supervisor_1",
+            )
+
+        # Legacy 3-column routes.sqlite3 upgrades cleanly to 4-column PK schema
+        legacy_routes_db = self.tmpdir / "legacy_routes.sqlite3"
+        rconn = sqlite3.connect(str(legacy_routes_db))
+        rconn.executescript(
+            """
+            CREATE TABLE routes (
+                tenant_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                contact_ref TEXT NOT NULL,
+                external_target TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (tenant_id, channel, contact_ref)
+            );
+            """
+        )
+        rconn.commit()
+        rconn.close()
+
+        upgraded_routes = EphemeralRouteStore(legacy_routes_db, default_ttl_seconds=60)
+        upgraded_routes.put(
+            tenant_id="acme",
+            channel="chatwoot",
+            contact_ref="ref-9999",
+            external_target="101",
+            external_conversation_id="cw-101",
+        )
+        found = upgraded_routes.get(
+            tenant_id="acme",
+            channel="chatwoot",
+            contact_ref="ref-9999",
+            external_conversation_id="cw-101",
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["external_target"], "101")

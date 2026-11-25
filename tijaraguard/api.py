@@ -343,13 +343,13 @@ class TijaraGuardHTTPServer:
                                     else {"providers": [], "routing": {}}
                                 ),
                                 "channels": app.pipeline.channel_registry.list_status(),
-                                "catalog_size": len(app.pipeline.commercial_gate.catalog.list_all()),
+                                "catalog_size": app.pipeline.commercial_gate.catalog.total_count,
                             },
                         )
                         return
 
                     if path == "/api/v1/catalog":
-                        items = [i.to_dict() for i in app.pipeline.commercial_gate.catalog.list_all()]
+                        items = [i.to_dict() for i in app.pipeline.commercial_gate.catalog.list_items()]
                         self._send_json(200, {"items": items})
                         return
 
@@ -717,11 +717,16 @@ class TijaraGuardHTTPServer:
                             confirm_deliv = parse_bool_strict(
                                 data.get("confirm_delivered", True), "confirm_delivered"
                             )
+                            recipient_target = data.get("recipient_target")
+                            if recipient_target is not None and not isinstance(
+                                recipient_target, str
+                            ):
+                                raise MalformedInputError("recipient_target must be a string.")
                             outcome = app.pipeline.dispatch(
                                 draft_id,
                                 token,
                                 confirm_delivered=confirm_deliv,
-                                recipient_target=data.get("recipient_target"),
+                                recipient_target=recipient_target,
                             )
                             self._send_json(
                                 200,

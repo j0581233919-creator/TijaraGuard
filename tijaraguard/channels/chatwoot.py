@@ -100,7 +100,7 @@ class ChatwootAdapter(ChannelAdapter):
         except SSRFError as exc:
             raise ChannelError(f"Invalid Chatwoot base_url: {exc}") from exc
         self.account_id = str(config.account_id or "1").strip()
-        if not self.account_id.isdigit():
+        if not (self.account_id.isascii() and self.account_id.isdigit()):
             raise ChannelError("Chatwoot account_id must be numeric.")
         self.endpoint_url = f"{self.base_url}/api/v1/accounts/{self.account_id}/conversations"
 

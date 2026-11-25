@@ -111,7 +111,11 @@ def _validate_url_syntax(
         raise SSRFError("Outbound URL must not embed credentials.")
     if parsed.fragment:
         raise SSRFError("Outbound URL must not contain a fragment.")
-    if parsed.port is not None and not (1 <= parsed.port <= 65535):
+    try:
+        port_val = parsed.port
+    except ValueError as exc:
+        raise SSRFError(f"Outbound URL has invalid port: {exc}") from exc
+    if port_val is not None and not (1 <= port_val <= 65535):
         raise SSRFError("Outbound URL port is out of range.")
 
     host = parsed.hostname.lower()
@@ -119,7 +123,7 @@ def _validate_url_syntax(
     if scheme == "http" and not (allow_http_loopback and is_literal_loopback):
         raise SSRFError("Plain HTTP is prohibited except for explicit literal loopback testing.")
 
-    port = parsed.port or (443 if scheme == "https" else 80)
+    port = port_val or (443 if scheme == "https" else 80)
     return url.rstrip("/"), scheme, host, port, is_literal_loopback
 
 

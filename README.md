@@ -34,6 +34,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard demo
 # 3. Validate configuration and start the REST API + Operator Dashboard
 cp .env.example .env
 # Edit .env with your secrets/keys (keep TIJARAGUARD_MODE=SIMULATED_NO_SEND until ready)
+set -a && source .env && set +a
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard check-config
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard serve
 

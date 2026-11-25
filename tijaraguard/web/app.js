@@ -46,9 +46,9 @@ function escapeHtml(s) {
   }[c]));
 }
 
-async function refreshAll() {
+async function refreshAll(preserveNotice = false) {
   try {
-    clearNotice();
+    if (!preserveNotice) clearNotice();
     const stateVal = document.getElementById("stateFilter").value;
     const qs = stateVal ? "?state=" + encodeURIComponent(stateVal) : "";
     const [st, usage, drafts] = await Promise.all([
@@ -242,7 +242,7 @@ async function handleInspectorAction(btn) {
       issuedLeases.delete(draftId);
       showNotice(`Draft ${draftId} rejected.`);
     }
-    await refreshAll();
+    await refreshAll(true);
     await inspectDraft(draftId);
   } catch (err) {
     showNotice(err.message, true);
@@ -295,7 +295,7 @@ document.getElementById("submitInqBtn").addEventListener("click", async () => {
     };
     const res = await api("/api/v1/inquiries", { method: "POST", body: JSON.stringify(payload) });
     showNotice(`Draft ${res.draft_id} created (${res.state}).`);
-    await refreshAll();
+    await refreshAll(true);
     await inspectDraft(res.draft_id);
   } catch (err) {
     showNotice(err.message, true);

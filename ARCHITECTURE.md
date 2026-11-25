@@ -31,7 +31,7 @@ flowchart TD
 - `tijaraguard/privacy.py` & `tijaraguard/commerce.py`: Gate 1 (`BayanGate`) and Gate 2 (`CatalogCopilot`) adapters.
 - `tijaraguard/ledger.py`: Schema v2 SQLite WAL ledger (`drafts`, `approvals`, `audit_events`, `channel_events`, `provider_usage`, `schema_migrations`), safe v1->v2 migration, hot backup/restore, retention purge, and separate `EphemeralRouteStore`.
 - `tijaraguard/pipeline.py` & `tijaraguard/runtime.py`: End-to-end 4-gate orchestration and dependency injection.
-- `tijaraguard/api.py`, `tijaraguard/web/index.html`, `tijaraguard/cli.py`: Authenticated REST API, webhook endpoints, lightweight RTL/LTR operator dashboard, and full CLI.
+- `tijaraguard/api.py`, `tijaraguard/web/index.html`, `tijaraguard/web/app.js`, `tijaraguard/cli.py`: Authenticated REST API, webhook endpoints, lightweight RTL/LTR operator dashboard, and full CLI.
 
 ## 3. Honesty & Verification Boundaries
 

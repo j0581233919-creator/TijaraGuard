@@ -93,11 +93,13 @@ class TestAPIAndCLI(unittest.TestCase):
                 st_h, _, html = self._http(srv.base_url, "GET", "/")
                 self.assertEqual(st_h, 200)
                 self.assertIn("TijaraGuard Operator Console", html)
+                self.assertIn("ACCEPTED_DELIVERY", html)
                 self.assertNotIn("op-secret-key-2026", html)
                 self.assertNotIn("onclick=", html)
                 st_js, _, js_code = self._http(srv.base_url, "GET", "/app.js")
                 self.assertEqual(st_js, 200)
                 self.assertIn("issuedLeases", js_code)
+                self.assertIn("refreshAll(true)", js_code)
 
                 # 2. Protected /api/v1/* fails closed without valid Bearer/X-API-Key (even on invalid JSON)
                 st_u, _, _ = self._http(srv.base_url, "GET", "/api/v1/status")
@@ -121,6 +123,20 @@ class TestAPIAndCLI(unittest.TestCase):
                 bad_conn.close()
 
                 auth = {"Authorization": "Bearer op-secret-key-2026"}
+
+                # Authenticated /api/v1/status and /api/v1/catalog return 200 with catalog metadata
+                st_ok, _, st_raw = self._http(srv.base_url, "GET", "/api/v1/status", headers=auth)
+                self.assertEqual(st_ok, 200)
+                st_data = json.loads(st_raw)
+                self.assertEqual(st_data["mode"], "LOOPBACK_LIVE")
+                self.assertGreaterEqual(st_data["catalog_size"], 1)
+                self.assertTrue(st_data["audit_chain_valid"])
+
+                st_cat, _, cat_raw = self._http(srv.base_url, "GET", "/api/v1/catalog", headers=auth)
+                self.assertEqual(st_cat, 200)
+                cat_data = json.loads(cat_raw)
+                self.assertIsInstance(cat_data.get("items"), list)
+                self.assertGreaterEqual(len(cat_data["items"]), 1)
 
                 # Malformed query/body integers return 400 (never 500)
                 self.assertEqual(
@@ -220,6 +236,21 @@ class TestAPIAndCLI(unittest.TestCase):
                     body={},
                 )
                 self.assertEqual(st_dp_empty, 409)
+
+                # Non-string recipient_target returns 400 (never 500)
+                st_dp_bad_target, _, _ = self._http(
+                    srv.base_url,
+                    "POST",
+                    f"/api/v1/drafts/{draft['draft_id']}/dispatch",
+                    headers=auth,
+                    body={
+                        "lease_id": lease["lease_id"],
+                        "approval_mac": lease["approval_mac"],
+                        "payload_sha256": lease["payload_sha256"],
+                        "recipient_target": 966501234567,
+                    },
+                )
+                self.assertEqual(st_dp_bad_target, 400)
 
                 # Bad confirm_delivered="false" string is rejected or parsed strictly (not coerced to True)
                 st_dp, _, dp_raw = self._http(

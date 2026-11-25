@@ -1154,6 +1154,13 @@ class ApprovalLedger:
                 raise VerificationBlockedError(
                     f"Cannot edit draft '{draft_id}' in terminal or post-dispatch state '{from_state}'."
                 )
+            if (
+                draft.get("redacted_inquiry") == "[PURGED_BY_RETENTION]"
+                or draft.get("body") == "[PURGED_BY_RETENTION]"
+            ):
+                raise VerificationBlockedError(
+                    f"Cannot edit draft '{draft_id}' because its content was purged by retention policy."
+                )
 
             cur = conn.execute(
                 """
@@ -1623,7 +1630,8 @@ class ApprovalLedger:
                 UPDATE drafts
                 SET redacted_inquiry='[PURGED_BY_RETENTION]',
                     body='[PURGED_BY_RETENTION]',
-                    consent_evidence='[PURGED_BY_RETENTION]',
+                    consent_to_contact=0,
+                    consent_evidence='',
                     channel_metadata_json='{{}}',
                     updated_at=?
                 WHERE retention_expires_at IS NOT NULL
@@ -1825,6 +1833,28 @@ class EphemeralRouteStore:
                 CREATE INDEX IF NOT EXISTS idx_routes_expiry ON routes(expires_at);
                 """
             )
+            cols = conn.execute("PRAGMA table_info(routes)").fetchall()
+            has_conv_pk = any(
+                row["name"] == "external_conversation_id" and int(row["pk"] or 0) > 0
+                for row in cols
+            )
+            if not has_conv_pk:
+                conn.executescript(
+                    """
+                    DROP TABLE routes;
+                    CREATE TABLE routes (
+                        tenant_id TEXT NOT NULL,
+                        channel TEXT NOT NULL,
+                        contact_ref TEXT NOT NULL,
+                        external_conversation_id TEXT NOT NULL DEFAULT '',
+                        external_target TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        expires_at REAL NOT NULL,
+                        PRIMARY KEY (tenant_id, channel, contact_ref, external_conversation_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_routes_expiry ON routes(expires_at);
+                    """
+                )
 
     def put(
         self,

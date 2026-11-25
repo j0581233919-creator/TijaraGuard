@@ -59,6 +59,8 @@ class TestSecurityAndConfig(unittest.TestCase):
             "https://api.openai.com/v1#frag",
             "https://localhost/api",
             "ftp://example.com/file",
+            "https://example.com:99999/v1",
+            "https://example.com:abc/v1",
         ]
         for bad_url in blocked_urls:
             with self.assertRaises(SSRFError, msg=f"Expected SSRFError for {bad_url}"):
@@ -217,3 +219,29 @@ class TestSecurityAndConfig(unittest.TestCase):
         rep_wh_bad = validate_config(cfg_wh_bad)
         self.assertFalse(rep_wh_bad["valid"])
         self.assertTrue(any("receipt_lookup_url" in e for e in rep_wh_bad["errors"]))
+
+        # String "false" in JSON provider enabled must NOT coerce via bool() to True
+        import json
+
+        cfg_file = self.tmpdir / "providers_str_bool.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "p1": {
+                            "kind": "openai_compat",
+                            "model": "gpt-4o-mini",
+                            "base_url": "https://api.openai.com/v1",
+                            "api_key": "sk-test-disabled",
+                            "enabled": "false",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg_str_bool = load_config(
+            config_file=cfg_file,
+            env={"TIJARAGUARD_CATALOG_PATH": str(CATALOG_PATH)},
+        )
+        self.assertFalse(cfg_str_bool.providers["p1"].enabled)

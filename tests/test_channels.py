@@ -631,3 +631,98 @@ class TestChannels(unittest.TestCase):
             )
         )
         self.assertEqual(st_late["state"], DraftState.FAILED_DELIVERY.value)
+
+        # Chatwoot rejects non-ASCII Unicode digits in account_id
+        with self.assertRaises(ChannelError):
+            ChatwootAdapter(
+                ChatwootConfig(
+                    enabled=True,
+                    base_url=self.gw.base_url,
+                    account_id="١٢٣",
+                    api_access_token="cw-api-token-secret",
+                    webhook_secret="cw-webhook-secret",
+                ),
+                allow_loopback=True,
+            )
+
+        # Telegram 10-digit Luhn chat_id is hashed (not persisted raw or rejected as Saudi ID)
+        tg10_events, _ = tg.parse_inbound(
+            {
+                "update_id": 7002,
+                "message": {
+                    "message_id": 13,
+                    "date": now_ts,
+                    "chat": {"id": 1082345677},
+                    "from": {"id": 1082345677},
+                    "text": "كم سعر ماكينة قهوة ديلونجي EC685؟",
+                },
+            },
+            tenant_id="acme",
+        )
+        ing_tg10 = pipe.ingest_channel_event(tg10_events[0])
+        self.assertEqual(ing_tg10["state"], DraftState.PENDING_APPROVAL.value)
+        self.assertEqual(
+            scan_sqlite_for_secrets(self.tmpdir / "ledger_acme.sqlite3", ["1082345677"]),
+            [],
+        )
+        tok_tg10 = pipe.approve(
+            ing_tg10["draft_id"],
+            reviewer_id="sup",
+            expected_payload_sha256=ing_tg10["payload_sha256"],
+        )
+        out_tg10 = pipe.dispatch(ing_tg10["draft_id"], tok_tg10)
+        self.assertEqual(out_tg10.state, DraftState.DELIVERED.value)
+        self.assertEqual(self.gw.outbound_requests[-1]["body"]["chat_id"], "1082345677")
+
+        # Failed WhatsApp status error containing PII is scrubbed before audit persistence
+        wa_fail_events, _ = wa.parse_inbound(
+            {
+                "entry": [
+                    {
+                        "changes": [
+                            {
+                                "value": {
+                                    "contacts": [{"wa_id": "966508887766", "profile": {"name": "عميل_حالة"}}],
+                                    "messages": [
+                                        {
+                                            "id": "wamid.fail.pii.1",
+                                            "from": "966508887766",
+                                            "timestamp": str(now_ts),
+                                            "type": "text",
+                                            "text": {"body": "كم سعر ماكينة قهوة ديلونجي EC685؟"},
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            tenant_id="acme",
+        )
+        ing_wa_fail = pipe.ingest_channel_event(wa_fail_events[0])
+        tok_wa_fail = pipe.approve(
+            ing_wa_fail["draft_id"],
+            reviewer_id="sup",
+            expected_payload_sha256=ing_wa_fail["payload_sha256"],
+        )
+        out_wa_fail = pipe.dispatch(ing_wa_fail["draft_id"], tok_wa_fail, confirm_delivered=False)
+        self.assertEqual(out_wa_fail.state, DraftState.ACCEPTED_DELIVERY.value)
+        st_wa_fail = pipe.process_status_event(
+            ChannelStatusEvent(
+                channel="whatsapp",
+                external_event_id="st-wa-fail-pii-1",
+                external_message_id="wamid.HBgMOTE5OTAwMDAwMDAw",
+                status="failed",
+                timestamp=float(now_ts),
+                error="Delivery failed for leaked.user@example.com or +966509876543",
+            )
+        )
+        self.assertEqual(st_wa_fail["state"], DraftState.FAILED_DELIVERY.value)
+        self.assertEqual(
+            scan_sqlite_for_secrets(
+                self.tmpdir / "ledger_acme.sqlite3",
+                ["leaked.user@example.com", "+966509876543"],
+            ),
+            [],
+        )

@@ -442,11 +442,16 @@ class TijaraGuardPipeline:
 
         if status_event.status == "failed":
             if current_state == DraftState.ACCEPTED_DELIVERY.value:
+                safe_error = (
+                    self.privacy_gate.redact_text_full(str(status_event.error))
+                    if status_event.error
+                    else None
+                )
                 updated = self.ledger.record_delivery_state(
                     draft_id,
                     DraftState.FAILED_DELIVERY,
                     receipt_id=norm_receipt,
-                    details={"status_callback": "failed", "error": status_event.error},
+                    details={"status_callback": "failed", "error": safe_error},
                     actor=f"webhook_{status_event.channel}",
                 )
                 return {"matched": True, "draft_id": draft_id, "state": updated["state"]}
@@ -574,6 +579,8 @@ class TijaraGuardPipeline:
             raise DeliveryError(f"Channel '{channel}' is not configured for LIVE dispatch.")
 
         if explicit_target is not None:
+            if not isinstance(explicit_target, str):
+                raise MalformedInputError("recipient_target must be a string.")
             clean = explicit_target.strip()
             if not clean:
                 raise MalformedInputError("recipient_target must not be empty.")

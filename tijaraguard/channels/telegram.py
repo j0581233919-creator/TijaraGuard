@@ -123,17 +123,13 @@ class TelegramBotAdapter(ChannelAdapter):
             sender = msg.get("from") or {}
             if sender.get("is_bot"):
                 continue
+            chat_str = str(chat_id)
             handle = str(
                 sender.get("username")
                 or sender.get("first_name")
-                or f"tg_{str(chat_id).lstrip('-')}"
+                or normalize_receipt_id("tg_user", chat_str)
             )
-            chat_str = str(chat_id)
-            safe_conv = (
-                f"tg-{chat_str}"
-                if chat_str.lstrip("-").isdigit()
-                else normalize_receipt_id("tg", chat_str)
-            )
+            safe_conv = normalize_receipt_id("tg", chat_str)
 
             events.append(
                 ChannelInboundEvent(
