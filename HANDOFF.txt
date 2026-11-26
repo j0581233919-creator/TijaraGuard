@@ -1,0 +1,403 @@
+================================================================================
+TIJARAGUARD — PERMANENT ENGINEERING HANDOFF & CONTINUITY RECORD
+================================================================================
+Release Tag : v0.2.0-beta.1 (PyPI package version: 0.2.0b1)
+Date (UTC)  : 2026-11-26
+Status      : Prerelease Beta — Audited & Automated-Tested (Live External SaaS/AI APIs NOT_TESTED)
+
+================================================================================
+A. PROJECT IDENTITY
+================================================================================
+1. Purpose & Commercial Use Case
+   TijaraGuard is a self-hosted and cloud-deployable commercial customer-support
+   and sales-assistance platform designed for Arabic (Gulf, Egyptian, Levantine,
+   Modern Standard Arabic) and English retail/merchant operations. It sits
+   between inbound customer messaging channels (WhatsApp Business Cloud API,
+   Telegram Bot API, Chatwoot, Generic Signed Webhook/REST), external or local
+   AI drafting models (OpenAI-compatible providers, Anthropic Claude, Google
+   Gemini, optional Ollama), human supervisors, and outbound delivery,
+   enforcing four mandatory safety gates so raw customer PII never leaks and
+   AI hallucinations never become unauthorized commercial promises.
+
+2. Current Architecture
+   - Zero external PyPI runtime dependencies (`dependencies = []` in
+     `pyproject.toml`, Python >=3.11 stdlib + SQLite WAL).
+   - Four sequential gates orchestrated by `TijaraGuardPipeline`:
+     * Gate 1 (Privacy / BayanGate): Redacts regional/MENA PII and replaces raw
+       contact identifiers with HMAC-SHA256 `contact_ref` handles *before* AI
+       model calls, SQLite writes, logs, or exceptions.
+     * Gate 2 (Commercial Truth / CatalogCopilot): Parses Arabic dialect and
+       English inquiries, resolves catalog SKUs, validates documented consent,
+       and deterministically verifies prices, stock, discounts, warranty terms,
+       and claims (treating AI outputs as untrusted drafts).
+     * Gate 3 (Human Approval / ApprovalLedger): Defaults to Shadow Mode
+       (`SIMULATED_NO_SEND`), binds single-use HMAC-SHA256 approval leases
+       atomically to `(draft_id, payload_sha256, lease_id)`, supports
+       edit/re-verify/reject/escalate, and records an append-only SHA-256
+       hash-chained `audit_events` log protected by SQLite immutability triggers.
+     * Gate 4 (Reliable Delivery / MessageShield): Uses durable outbox tracking,
+       deterministic idempotency keys, conservative `UNKNOWN_DELIVERY` handling,
+       read-only receipt reconciliation without blind replay, and isolated
+       `EphemeralRouteStore` (`routes.sqlite3`) target resolution.
+
+3. Canonical Paths, Repository & Version Identity
+   - Canonical Local Workspace : /media/islam/shared pop/GitHub/tijaraguard-prototype
+   - GitHub Repository URL     : https://github.com/j0581233919-creator/TijaraGuard
+   - Branch                    : main
+   - Audited Code Commit (EGM) : 17d273be3021f1ebe3ed4381663a3d11131c123c
+   - Release Docs Commit       : cb05ca3e6035f02f8b747c685aa48ff91babb9c3
+   - Release Tag               : v0.2.0-beta.1 (annotated tag on final HEAD including this HANDOFF.txt)
+
+================================================================================
+B. ENGINEERING HISTORY
+================================================================================
+1. Immutable Starting Baseline
+   - Starting Repository : /media/islam/shared pop/GitHub/tijaraguard-prototype
+   - Starting Branch     : main
+   - Verified Base Commit: 066a8447efc37e99b4f0fd289062e435f009447d
+     (Previously completed 3 isolated-MVP audit rounds: ACCEPTED_WITH_MINOR_NOTES,
+      0 HIGH, 0 MEDIUM, 2 LOW, 2 INFO, 32/32 tests passing.)
+
+2. Complete Local Commit History on `main` (Preserved Intact)
+   - 7275d83666b736ac81bb1fcb6d23e3d6f64c557a : Initial Track 2 TijaraGuard isolated integration MVP
+   - 1160930ba42738bc6b84ff7702af7798be9e9dc8 : Remediate EGM audit Round 1 findings (MVP phase)
+   - 066a8447efc37e99b4f0fd289062e435f009447d : Remediate EGM audit Round 2 findings (MVP phase baseline)
+   - a19cd897ef76d5e54724ce6711a84cea1e1644bb : Productize TijaraGuard: vendored deps, security, migrations, real AI providers, channels, REST API, dashboard, CLI, and 48-test suite
+   - fe6dc9f097385d4eb3b1cf00978025ff535bd2ef : Remediate EGM Round 1 findings (HIGH/MEDIUM/LOW) and expand regression suite to 50 tests
+   - 17d273be3021f1ebe3ed4381663a3d11131c123c : Remediate EGM Round 2 findings (HIGH-1, MEDIUM-1..2, Security M-1, LOW/INFO); 51/51 tests passing
+   - cb05ca3e6035f02f8b747c685aa48ff91babb9c3 : docs: finalize v0.2.0-beta.1 release documentation and ledger (zero Python source changes)
+   - Final Tagged HEAD   : Commit adding this HANDOFF.txt (tagged v0.2.0-beta.1)
+
+3. Immutable Upstream Dependency Repositories (Unmodified Throughout)
+   All four local sibling repositories under `/media/islam/shared pop/GitHub/`
+   remain clean, unmodified, and untouched at their exact pinned commits:
+   - bayan-gate/repo      : 1d6b83a46cb75484a434efe17be2e7d97885050c (v1.0.1, MIT)
+   - catalog-copilot/repo : 12522d3b17767ae9a4766499b6495fd4231ebcfc (v1.0.1, MIT)
+   - message-shield/repo  : 4ccbc2641c18b47a9feadbe41010a06fb2791275 (v0.1.0, MIT)
+   - quote-judge/repo     : 0563ddd2af8646962a5d627402119b007a9cfc37 (MIT — out of scope)
+   MIT-attributed standalone snapshots are bundled inside `tijaraguard/_vendor/`
+   with `tijaraguard/_vendor/MANIFEST.json` SHA-256 verification and root
+   `THIRD_PARTY_NOTICES.md`.
+
+4. Implementation Milestones (M1 - M9)
+   - M1: MIT-attributed vendored snapshots + SHA-256 manifest + `deps.py` + `data/catalog.json`
+   - M2: Security hardening (`security.py`) & fail-closed configuration (`config.py`, `.env.example`)
+   - M3: Persistence v2 (`ledger.py`), safe v1->v2 migration preserving `audit_events`, hot backup/restore, retention purge, `EphemeralRouteStore`
+   - M4: Real cloud AI providers (`openai_compat`, `anthropic`, `gemini`, optional `ollama`), `HardenedJSONHttpClient`, `ModelRouter`
+   - M5: Official messaging channels (`whatsapp`, `telegram`, `chatwoot`, `webhook`), `ChannelShieldTransport`, `ChannelRegistry`
+   - M6: Full 4-gate orchestration (`pipeline.py`, `runtime.py`), REST API & webhooks (`api.py`), RTL/LTR Operator Web Console (`web/index.html`, `web/app.js`), CLI (`cli.py`), deployment files (`deploy/`)
+   - M7-M8: Protocol HTTP server tests, security/adversarial suites, EGM Round 1 & Round 2 remediations (`fe6dc9f`, `17d273b`)
+   - M9: Independent Round 3 EGM acceptance, clean-room wheel build & verification, GitHub release `v0.2.0-beta.1`, and `HANDOFF.txt`
+
+5. Independent Read-Only EGM Audit Verdicts & Audited Commits
+   - Round 1 (Audited Commit `a19cd897ef76d5e54724ce6711a84cea1e1644bb`):
+     `egm-design` & `egm-codebase-details` -> `REJECTED` (all HIGH/MEDIUM/LOW fixed in `fe6dc9f`).
+   - Round 2 (Audited Commit `fe6dc9f097385d4eb3b1cf00978025ff535bd2ef`):
+     `egm-design` (0 HIGH, 1 MEDIUM, 3 LOW, 2 INFO) & `egm-codebase-details` (1 HIGH, 2 MEDIUM, 2 LOW, 1 INFO) -> `REJECTED` (all HIGH/MEDIUM and most LOW/INFO fixed + regression-tested in `17d273b`).
+   - Round 3 Final Audit (Audited Commit `17d273be3021f1ebe3ed4381663a3d11131c123c`):
+     * `egm-design` (Security & Architecture): **`ACCEPTED_WITH_MINOR_NOTES`** (0 HIGH, 0 MEDIUM, 2 LOW, 3 INFO)
+     * `egm-codebase-details` (Technical & Completeness): **`ACCEPTED_WITH_MINOR_NOTES`** (0 HIGH, 0 MEDIUM, 1 LOW, 2 INFO)
+     * Post-`17d273b` commits touch documentation (`DEPLOYMENT.md`, `README.md`, `INSTALL.md`, `LEDGER.md`, `HANDOFF.txt`) only; zero code changes under `tijaraguard/`, `tests/`, or `pyproject.toml`.
+
+================================================================================
+C. COMPLETE IMPLEMENTATION MAP
+================================================================================
+1. Repository Layout
+   tijaraguard-prototype/
+   ├── .env.example
+   ├── .gitignore
+   ├── ARCHITECTURE.md
+   ├── DEPLOYMENT.md
+   ├── HANDOFF.txt
+   ├── INSTALL.md
+   ├── LEDGER.md
+   ├── LICENSE
+   ├── README.md
+   ├── SECURITY.md
+   ├── THIRD_PARTY_NOTICES.md
+   ├── pyproject.toml
+   ├── deploy/
+   │   ├── Dockerfile
+   │   ├── nginx-tijaraguard.conf
+   │   └── tijaraguard.service
+   ├── examples/
+   │   ├── catalog.json
+   │   └── scenarios.json
+   ├── tests/
+   │   ├── helpers.py
+   │   ├── test_api_and_cli.py
+   │   ├── test_channels.py
+   │   ├── test_cleanroom_install.py
+   │   ├── test_e2e_pipeline.py
+   │   ├── test_e2e_product.py
+   │   ├── test_gate1_privacy.py
+   │   ├── test_gate2_commerce.py
+   │   ├── test_gate3_approval.py
+   │   ├── test_gate4_delivery.py
+   │   ├── test_persistence_and_migrations.py
+   │   ├── test_providers.py
+   │   └── test_security_and_config.py
+   ├── tijaraguard/
+   │   ├── __init__.py          (lazy public exports for fast CLI/startup)
+   │   ├── __main__.py          (`python3 -m tijaraguard`)
+   │   ├── api.py               (ThreadingHTTPServer REST API, webhooks, dashboard host)
+   │   ├── cli.py               (18-command CLI entrypoint)
+   │   ├── commerce.py          (Gate 2 CommercialGate wrapping CatalogCopilot + AI drafting)
+   │   ├── config.py            (JSON + ENV config loader & fail-closed startup validator)
+   │   ├── data/catalog.json    (bundled catalog for non-editable / wheel / Docker installs)
+   │   ├── delivery.py          (Gate 4 DeliveryGate + LocalLoopbackReceiver wrapping MessageShield)
+   │   ├── demo.py              (4-gate synthetic Arabic business end-to-end demo)
+   │   ├── deps.py              (dependency loader + vendor MANIFEST SHA-256 verification)
+   │   ├── ledger.py            (Gate 3 SQLite WAL ApprovalLedger v2 + EphemeralRouteStore)
+   │   ├── models.py            (domain models, strict state transitions, custom errors)
+   │   ├── pipeline.py          (end-to-end 4-gate coordinator across SHADOW/LOOPBACK_LIVE/LIVE)
+   │   ├── privacy.py           (Gate 1 PrivacyGate wrapping BayanGate + HMAC contact_ref)
+   │   ├── runtime.py           (dependency injection & redacting log filter setup)
+   │   ├── security.py          (SSRF + DNS-pinned HTTP/HTTPS, HMAC, Bearer auth, rate limit, CSV, log filter)
+   │   ├── channels/
+   │   │   ├── __init__.py
+   │   │   ├── base.py          (ChannelAdapter, ChannelInboundEvent, ChannelStatusEvent, ChannelShieldTransport, ChannelRegistry)
+   │   │   ├── chatwoot.py      (ChatwootAdapter: webhooks, replay checks, private notes, handoff, replies)
+   │   │   ├── telegram.py      (TelegramBotAdapter: webhook, getUpdates, sendMessage)
+   │   │   ├── webhook.py       (GenericWebhookAdapter: HMAC + timestamp inbound/outbound + receipt lookup)
+   │   │   └── whatsapp.py      (WhatsAppCloudAdapter: Meta Cloud Graph API challenge, X-Hub-Signature-256, send, status callbacks)
+   │   ├── providers/
+   │   │   ├── __init__.py
+   │   │   ├── anthropic.py     (AnthropicProvider: /v1/messages, x-api-key, anthropic-version)
+   │   │   ├── base.py          (AIProvider, AIRequest, AIResponse, AIErrorCategory, cost helpers)
+   │   │   ├── gemini.py        (GeminiProvider: /models/{model}:generateContent, x-goog-api-key header)
+   │   │   ├── http_client.py   (HardenedJSONHttpClient: SSRF + DNS-pinned dial, no redirects, 429/retry classification)
+   │   │   ├── ollama.py        (OllamaProvider: optional local /api/chat & /api/tags)
+   │   │   ├── openai_compat.py (OpenAICompatibleProvider: OpenAI, Groq, OpenRouter, Mistral, custom base URLs)
+   │   │   └── router.py        (ModelRouter: simple/standard/complex routing, pre-send PII guard, explicit fallback, usage persistence)
+   │   ├── web/
+   │   │   ├── app.js           (external CSP-safe JS console logic)
+   │   │   └── index.html       (lightweight RTL/LTR operator web UI)
+   │   └── _vendor/             (MIT snapshots: bayan_gate, catalog_copilot, message_shield, MANIFEST.json)
+   └── verification/
+       ├── COMMANDS.md
+       └── verification_run.log
+
+2. SQLite Persistence Schema (Schema v2 — `ledger.sqlite3`)
+   - `schema_migrations(version, applied_at, description)`
+   - `drafts`: Stores ONLY redacted inquiries, opaque HMAC `contact_ref`, hashed
+     `conversation_id`, commercial verification reports, canonical `payload_sha256`,
+     workflow `state`, delivery key/receipt, `ai_provider`/`ai_model`/`ai_metadata_json`,
+     sanitized `channel_metadata_json`, `escalation_reason`, `retention_expires_at`,
+     and `tenant_id`. Never stores raw phone numbers or external chat IDs.
+   - `approvals`: Single-use HMAC-SHA256 approval leases bound to `(draft_id,
+     payload_sha256, lease_id)` with unique partial index `idx_one_active_approval`.
+   - `audit_events`: Append-only hash-chained event table (`seq`, `prev_hash`,
+     `event_hash`) protected by `audit_events_no_update` and `audit_events_no_delete`
+     SQLite triggers.
+   - `channel_events`: Channel webhook/update idempotency & replay deduplication
+     with hashed `external_event_id`.
+   - `provider_usage`: Per-attempt AI provider latency, token counts, cost, status,
+     and failure classification linked to `draft_id` and `tenant_id`.
+   - Safe `v1 -> v2` migration adds v2 columns/tables/indexes in a transaction, runs
+     `PRAGMA foreign_key_check`, and preserves historical `audit_events` & triggers.
+   - Separate `routes.sqlite3` (`EphemeralRouteStore`): Stores TTL-expiring delivery
+     routing targets keyed by `(tenant_id, channel, contact_ref, external_conversation_id)`
+     with automatic upgrade from legacy 3-column primary keys.
+
+3. CLI Commands (`tijaraguard <subcommand>`)
+   `inspect-deps`, `demo`, `verify-audit <ledger_db>`, `check-config`,
+   `serve [--host] [--port]`, `catalog-search <query> [--lang ar|en]`,
+   `ingest`, `drafts [--state] [--limit]`, `approve`, `reject`, `edit`,
+   `escalate`, `dispatch`, `recover`, `providers-health`, `backup`, `restore`,
+   `purge-retention`.
+
+4. REST API, Webhooks & Dashboard Endpoints (`tijaraguard/api.py`)
+   - UI & Probes (Public): `GET /`, `GET /app.js`, `GET /health`, `GET /ready`
+   - Webhooks (Channel-Auth / Fail-Closed):
+     `GET /webhooks/whatsapp`, `POST /webhooks/whatsapp`,
+     `POST /webhooks/telegram`, `POST /webhooks/chatwoot`, `POST /webhooks/generic`
+   - Authenticated Operator API (`Authorization: Bearer <key>` or `X-API-Key`):
+     `GET /api/v1/status`, `GET /api/v1/catalog`, `GET /api/v1/catalog/search`,
+     `GET /api/v1/conversations`, `GET /api/v1/drafts`, `GET /api/v1/drafts/<id>`,
+     `GET /api/v1/audit`, `GET /api/v1/audit/export.csv`,
+     `GET /api/v1/providers`, `GET /api/v1/channels`, `GET /api/v1/usage`,
+     `POST /api/v1/inquiries`, `POST /api/v1/providers/health`,
+     `POST /api/v1/maintenance/backup`, `POST /api/v1/maintenance/purge`,
+     `POST /api/v1/drafts/<id>/{approve,reject,edit,escalate,dispatch,recover}`
+
+================================================================================
+D. INSTALLATION AND OPERATIONS
+================================================================================
+1. Prerequisites & Runtime Dependencies
+   - Python >= 3.11 (verified on Python 3.12.3 on Linux).
+   - Runtime PyPI dependencies: NONE (`dependencies = []`, stdlib + SQLite WAL).
+
+2. Exact Installation Commands
+   Option A — From GitHub Prerelease Wheel (Recommended Offline/Clean-Room):
+     sha256sum -c SHA256SUMS.txt --ignore-missing
+     python3 -m venv .venv
+     .venv/bin/python -B -m pip install --no-deps tijaraguard-0.2.0b1-py3-none-any.whl
+     PYTHONDONTWRITEBYTECODE=1 .venv/bin/tijaraguard inspect-deps
+
+   Option B — From Clean Git Checkout:
+     git clone https://github.com/j0581233919-creator/TijaraGuard.git
+     cd TijaraGuard
+     python3 -m venv .venv
+     .venv/bin/python -B -m pip install --no-deps --no-build-isolation .
+     PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard inspect-deps
+
+3. Configuration & Environment Variable NAMES (Never store secrets in Git)
+   Template file: `.env.example` (or JSON config passed via `--config PATH`).
+   Core & Security:
+     - TIJARAGUARD_MODE (SIMULATED_NO_SEND | LOOPBACK_LIVE | LIVE)
+     - TIJARAGUARD_TENANT_ID
+     - TIJARAGUARD_STATE_DIR, TIJARAGUARD_LEDGER_DB, TIJARAGUARD_OUTBOX_DB,
+       TIJARAGUARD_ROUTES_DB, TIJARAGUARD_BACKUP_DIR, TIJARAGUARD_CATALOG_PATH
+     - TIJARAGUARD_APPROVAL_SECRET (>=32 random hex bytes required in LIVE)
+     - TIJARAGUARD_CONTACT_HASH_KEY (>=32 random hex bytes required in LIVE)
+     - TIJARAGUARD_API_KEY (required for /api/v1/* and non-loopback binds)
+     - TIJARAGUARD_HOST, TIJARAGUARD_PORT, TIJARAGUARD_RATE_LIMIT_PER_MIN,
+       TIJARAGUARD_WEBHOOK_REPLAY_WINDOW_SECONDS, TIJARAGUARD_RETENTION_DAYS,
+       TIJARAGUARD_ROUTE_TTL_SECONDS
+     - TIJARAGUARD_ALLOW_LOOPBACK_PROVIDERS, TIJARAGUARD_ALLOW_LOOPBACK_CHANNELS
+     - Optional upstream overrides: TIJARAGUARD_BAYAN_GATE_PATH,
+       TIJARAGUARD_CATALOG_COPILOT_PATH, TIJARAGUARD_MESSAGE_SHIELD_PATH
+   AI Provider Routing:
+     - TIJARAGUARD_DEFAULT_PROVIDER, TIJARAGUARD_PROVIDER_SIMPLE,
+       TIJARAGUARD_PROVIDER_STANDARD, TIJARAGUARD_PROVIDER_COMPLEX,
+       TIJARAGUARD_ALLOW_FALLBACK, TIJARAGUARD_FALLBACK_CHAIN,
+       TIJARAGUARD_FALLBACK_TO_TEMPLATE
+   Cloud AI Providers (configure any subset; Ollama is NOT required):
+     - OpenAI     : OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL
+     - Groq       : GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
+     - OpenRouter : OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL
+     - Mistral    : MISTRAL_API_KEY, MISTRAL_MODEL, MISTRAL_BASE_URL
+     - Anthropic  : ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_BASE_URL
+     - Google     : GEMINI_API_KEY, GEMINI_MODEL, GEMINI_BASE_URL
+     - Ollama     : OLLAMA_BASE_URL, OLLAMA_MODEL (optional local inference)
+   Official Communication Channels:
+     - WhatsApp Cloud API : WHATSAPP_ENABLED, WHATSAPP_PHONE_NUMBER_ID,
+       WHATSAPP_ACCESS_TOKEN, WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET,
+       WHATSAPP_API_VERSION, WHATSAPP_BASE_URL
+     - Telegram Bot API   : TELEGRAM_ENABLED, TELEGRAM_BOT_TOKEN,
+       TELEGRAM_WEBHOOK_SECRET, TELEGRAM_BASE_URL
+     - Chatwoot           : CHATWOOT_ENABLED, CHATWOOT_BASE_URL,
+       CHATWOOT_ACCOUNT_ID, CHATWOOT_API_ACCESS_TOKEN, CHATWOOT_WEBHOOK_SECRET
+     - Generic Webhook    : TIJARAGUARD_WEBHOOK_ENABLED,
+       TIJARAGUARD_WEBHOOK_INBOUND_SECRET, TIJARAGUARD_WEBHOOK_OUTBOUND_URL,
+       TIJARAGUARD_WEBHOOK_OUTBOUND_SECRET, TIJARAGUARD_WEBHOOK_LOOKUP_URL
+
+4. Start, Validate, Inspect, Troubleshoot, Backup & Restore
+   - Load env & validate fail-closed startup checks:
+       set -a && source .env && set +a
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard check-config
+   - Start API + Webhooks + Operator Console (terminate with SIGINT/SIGTERM for graceful shutdown):
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard serve
+   - Check provider health & audit chain integrity:
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard providers-health
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard verify-audit /var/lib/tijaraguard/ledger.sqlite3
+   - Hot WAL backup & verified atomic restore:
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard backup /var/lib/tijaraguard/backups/ledger.sqlite3
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard restore /var/lib/tijaraguard/backups/ledger.sqlite3 /var/lib/tijaraguard/ledger.sqlite3
+   - Retention purge:
+       PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard purge-retention
+   - Production VPS files: `deploy/tijaraguard.service`, `deploy/nginx-tijaraguard.conf`, `deploy/Dockerfile`, detailed in `DEPLOYMENT.md` and `SECURITY.md`.
+
+================================================================================
+E. VERIFICATION EVIDENCE
+================================================================================
+1. Automated Unit, Security, Protocol & E2E Suite (against audited code commit `17d273be3021f1ebe3ed4381663a3d11131c123c`)
+   Command:
+     cd "/media/islam/shared pop/GitHub/tijaraguard-prototype" && PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
+   Observed Result:
+     Ran 51 tests in 139.356s — OK (0 failures, 0 errors, 0 skipped).
+   Covers:
+     - Gate 1 Privacy (`test_gate1_privacy.py`): MENA PII redaction, Luhn checks, fail-closed HMAC contact hashes, zero PII in SQLite/logs/exceptions.
+     - Gate 2 Commerce (`test_gate2_commerce.py`): Gulf/MSA dialectal resolution, expired discounts, out-of-stock hallucinations, PII leaks in drafts, consent checks.
+     - Gate 3 Approval (`test_gate3_approval.py`): Shadow default, single-use atomic leases, payload tamper detection, trigger immutability & tail deletion detection.
+     - Gate 4 Delivery (`test_gate4_delivery.py`): Loopback outbox, duplicate retries, LOST ACK -> UNKNOWN_DELIVERY -> read-only recovery, subprocess SIGKILL recovery.
+     - AI Providers (`test_providers.py`): Local HTTP protocol servers for OpenAI-compat, Anthropic, Gemini (`x-goog-api-key`), Ollama; cloud-only without Ollama; timeouts, 401 auth errors, explicit fallback, pre-send PII block.
+     - Channels (`test_channels.py`): Local HTTP servers for WhatsApp Cloud (`GET` verify challenge, `X-Hub-Signature-256`, outbound, status callbacks + PII scrubbing), Telegram Bot (`webhook` + `getUpdates` + `sendMessage` + 10-digit Luhn `chat_id` hashing), Chatwoot (signature, replay window, private notes, handoff, concurrent multi-conversation route isolation), Generic Webhook.
+     - API, Dashboard, CLI, Migrations, Security (`test_api_and_cli.py`, `test_persistence_and_migrations.py`, `test_security_and_config.py`, `test_cleanroom_install.py`, `test_e2e_product.py`, `test_e2e_pipeline.py`).
+
+2. Clean-Room Wheel Installation Verification (Isolated `.tmp_test/release_verify` venv)
+   Installed `dist/tijaraguard-0.2.0b1-py3-none-any.whl` offline (`--no-deps`), executed outside repo root:
+     - `inspect-deps`: `vendor_manifest_verified: true`, all 3 deps loaded as `source: "vendored"` with pinned commits intact.
+     - `check-config`: `valid: true`, automatically resolved bundled `tijaraguard/data/catalog.json`.
+     - `demo`: exit code 0, all 4 scenario families and security/audit proofs present.
+
+3. Independent Audit Verdict
+   Round 3 Fresh-Context Read-Only EGM Audits on `17d273be3021f1ebe3ed4381663a3d11131c123c`:
+     - `egm-design`: `ACCEPTED_WITH_MINOR_NOTES` (0 HIGH, 0 MEDIUM, 2 LOW, 3 INFO)
+     - `egm-codebase-details`: `ACCEPTED_WITH_MINOR_NOTES` (0 HIGH, 0 MEDIUM, 1 LOW, 2 INFO)
+
+4. Honest Maturity Classification Matrix
+   - Core 4-gate domain pipeline & SQLite v2 persistence : AUTOMATED_TESTED
+   - Cloud AI adapters & ModelRouter (wire protocol via local HTTP) : AUTOMATED_TESTED
+   - Official Channel adapters (wire protocol via local HTTP) : AUTOMATED_TESTED
+   - CLI, REST API & Operator Console HTTP contract : AUTOMATED_TESTED
+   - Operator Web Dashboard interactive browser click-through : IMPLEMENTED (HTTP serving tested; headless browser UI NOT_TESTED)
+   - External live SaaS APIs (OpenAI, Groq, OpenRouter, Mistral, Anthropic, Gemini, Meta WhatsApp Cloud, Telegram Bot API, live Chatwoot) : NOT_TESTED (credentials unavailable)
+   - Production runtime deployment (`Dockerfile`, `systemd`, `nginx` TLS) : IMPLEMENTED / NOT_TESTED at target host runtime
+   - Live External Integration Status : NOT_TESTED (requires operator credentials; zero live claims fabricated)
+
+================================================================================
+F. RELEASE AND GITHUB
+================================================================================
+- Repository URL      : https://github.com/j0581233919-creator/TijaraGuard
+- Branch              : main
+- Release Tag         : v0.2.0-beta.1 (prerelease)
+- Audited Code SHA    : 17d273be3021f1ebe3ed4381663a3d11131c123c
+- Release Docs SHA    : cb05ca3e6035f02f8b747c685aa48ff91babb9c3
+- Release Archives (built inside local `dist/`, attached to GitHub Release `v0.2.0-beta.1`):
+  1. `tijaraguard-0.2.0b1-py3-none-any.whl`
+     SHA-256: f4a5961ef4cdf1eac49e331ea451fd5490136df50304902c8121c880577ea6a8
+  2. `tijaraguard-0.2.0b1.tar.gz`
+     SHA-256: e6b31eeb61ce45e782668a5f5a8d0b620ff204c7a013689bfa595b52fe39b22a
+  3. `TijaraGuard-v0.2.0-beta.1-src.tar.gz` (tagged repository archive generated after this commit)
+     SHA-256: Published in `SHA256SUMS.txt` attached to GitHub Release `v0.2.0-beta.1`
+  4. `SHA256SUMS.txt` (verified checksums for all three release archives)
+- Publication Status  : Published as public GitHub repository & prerelease `v0.2.0-beta.1`
+- CI Status           : NOT_CONFIGURED (no `.github/workflows/` automated pipeline yet)
+
+================================================================================
+G. KNOWN LIMITATIONS
+================================================================================
+1. Remaining Round 3 Audit Minor Notes (0 HIGH, 0 MEDIUM):
+   - Security LOW-1 (`tijaraguard/channels/{whatsapp,telegram,base}.py`, `pipeline.py:733-881`): Gateway HTTP 4xx error strings during `dispatch()` / `recover_delivery()` only run `scrub_secrets_from_text`, not `privacy_gate.redact_text_full()`, before recording into `outbox.sqlite3` / `audit_events`.
+   - Security LOW-2 (`tijaraguard/security.py:104`): `urlsplit(url)` on malformed IPv6 brackets (e.g., `https://[::1/v1`) raises bare `ValueError` instead of `SSRFError` (still fails closed).
+   - Codebase LOW-1 (`tijaraguard/config.py:824-828`): `validate_config()` checks `account_id` non-empty, deferring ASCII-digit rejection to `ChatwootAdapter.__init__` (`check-config` vs `serve`).
+   - Security INFO-1 (`tijaraguard/pipeline.py:601-612`): Explicit `recipient_target` fallback on Telegram when `EphemeralRouteStore` entry has expired does not prepend `"tg:"` before hashing `opaque_contact_ref()`.
+   - Security INFO-3 (`tijaraguard/cli.py:273-338`): Single-draft CLI commands do not enforce `draft["tenant_id"] == cfg.tenant_id` or require caller-supplied `lease_id`/`approval_mac` unlike the REST API.
+2. External Credentials & Live Endpoints: Live external AI APIs and live WhatsApp/Telegram/Chatwoot servers are `NOT_TESTED`.
+3. Persistence Boundary: SQLite WAL is single-node only (`BEGIN IMMEDIATE`); do not share one SQLite state directory across multiple replicas/NFS.
+4. BayanGate NER Scope: `DATE_OF_BIRTH` and free-text `PERSON_NAME` remain in `UNSUPPORTED_ENTITY_TYPES`; callers must supply pseudonymous `customer_handle` values.
+5. Filesystem Permissions on Windows/NTFS (`fuseblk`): Mounts ignoring POSIX `chmod` (`0600`/`0700`) must NOT be used for production secrets or databases; deploy on ext4/xfs POSIX filesystems.
+6. Container/Systemd/TLS & Headless Browser E2E: Statically implemented, not executed live in target container/VPS runtime.
+
+================================================================================
+H. NEXT WORK (PRIORITIZED ROADMAP)
+================================================================================
+P1. Fix Remaining Round 3 LOW/INFO Polish Items
+    - Target files: `tijaraguard/channels/{base,whatsapp,telegram}.py`, `tijaraguard/pipeline.py`, `tijaraguard/security.py`, `tijaraguard/config.py`, and regression tests.
+    - Acceptance: `ChannelShieldTransport` & `pipeline.py` scrub gateway error bodies with `privacy_gate.redact_text_full()`, `urlsplit` `ValueError` wraps to `SSRFError`, `validate_config()` rejects non-ASCII Chatwoot `account_id`, Telegram expired-route explicit target matches `opaque_contact_ref(f"tg:{...}")`, full suite passes.
+P2. Add GitHub Actions CI Workflow
+    - Target files: `.github/workflows/ci.yml`
+    - Acceptance: Runs `unittest discover -s tests -v` on Python 3.11 and 3.12, builds wheel, and runs clean-room wheel smoke tests on every push/PR.
+P3. Staging Verification with Real Operator Credentials (Opt-in Live Tests)
+    - Target: OpenAI/Anthropic/Gemini/Groq + WhatsApp Cloud Sandbox + Telegram test bot + Chatwoot staging instance over real HTTPS TLS.
+    - Acceptance: Observed real responses logged without PII/secret leakage, signature verification verified against real signed webhooks, promote maturity entries from `NOT_TESTED` to `LIVE_VERIFIED` only for directly exercised integrations.
+P4. Production VPS / Container + Browser Dashboard Verification
+    - Target files: `deploy/Dockerfile`, `deploy/tijaraguard.service`, `deploy/nginx-tijaraguard.conf`.
+    - Acceptance: Container builds and passes health/readiness probes behind TLS Nginx; automated headless browser test clicks all 10 dashboard workflows cleanly against live server.
+
+Non-Reversible Architectural Invariants (Do Not Break Without Evidence):
+- Gate 1 PII redaction and `verify_identifier_clean()` MUST execute BEFORE any SQLite write or external AI request; `ledger.sqlite3` must NEVER persist raw phones, chat IDs, or email targets.
+- `audit_events` immutability triggers (`audit_events_no_update`, `audit_events_no_delete`, unconditional `RAISE(ABORT, ...)` without `WHEN`/`WHERE`) and hash chain MUST be preserved across migrations.
+- `SIMULATED_NO_SEND` shadow default, human approval default, single-use `(draft_id, payload_sha256, lease_id)` leases, and explicit caller credentials on REST `POST /api/v1/drafts/{id}/dispatch` MUST remain enforced.
+- `EphemeralRouteStore` remains physically separate (`routes.sqlite3`), retention purge MUST keep `consent_to_contact=0`, `consent_evidence=''`, and block post-purge edits.
+- Upstream sibling repositories (`bayan-gate`, `catalog-copilot`, `message-shield`, `quote-judge`) remain immutable upstream sources.
+
+================================================================================
+I. NEW-SESSION CONTINUITY INSTRUCTIONS
+================================================================================
+Copy and paste this exact instruction when starting a fresh engineering session:
+
+"Read this HANDOFF.txt first. Then inspect the actual repository and Git state. Treat this document as the engineering continuity record, not as proof that the current source still matches it. Verify the recorded HEAD and tests before making changes. Preserve the existing architecture, original upstream repositories, security boundaries and documented decisions. Continue from the first incomplete priority without restarting the project or repeating completed work."
+================================================================================
