@@ -18,7 +18,7 @@
 | M3: Persistence v2 & Migrations | Schema v2, safe v1->v2 migration preserving `audit_events` & triggers, backup/restore, retention purge, `EphemeralRouteStore` | IMPLEMENTED |
 | M4: Real AI Providers | `providers/` (OpenAI-compat, Anthropic, Gemini, optional Ollama, `ModelRouter` with pre-send PII guard & explicit fallback) | IMPLEMENTED |
 | M5: Official Messaging Channels | `channels/` (WhatsApp Cloud, Telegram Bot, Chatwoot, Generic Webhook, `ChannelShieldTransport`, `ChannelRegistry`) | IMPLEMENTED |
-| M6: Pipeline, REST API, Dashboard, CLI | `pipeline.py` LIVE mode + channel ingestion/escalation, `runtime.py`, `api.py`, `web/index.html`, `cli.py`, deployment configs | IMPLEMENTED |
-| M7: Expanded Test & Protocol Suite | Protocol HTTP server tests, security, migrations, API/CLI, E2E Arabic scenarios, clean-room packaging | AUTOMATED_TESTED (50/50 passing) |
-| M8: EGM Audit Round 1 Remediation | Fixed all 6+6 HIGH, 8+6 MEDIUM, and LOW findings from `egm-design` and `egm-codebase-details` audits of `a19cd89` | AUTOMATED_TESTED (50/50 passing) |
-| M9: Final EGM Audit & Publication | Round 2 fresh-context read-only EGM audit, release packaging, GitHub publication, `HANDOFF.txt` | IN_PROGRESS |
+| M6: Pipeline, REST API, Dashboard, CLI | `pipeline.py` LIVE mode + channel ingestion/escalation, `runtime.py`, `api.py`, `web/index.html`, `web/app.js`, `cli.py`, deployment configs | IMPLEMENTED |
+| M7: Expanded Test & Protocol Suite | Protocol HTTP server tests, security, migrations, API/CLI, E2E Arabic scenarios, clean-room packaging (`fe6dc9f` -> `17d273b`) | AUTOMATED_TESTED (51/51 passing) |
+| M8: EGM Audits Round 1 & Round 2 Remediation | Fixed all Round 1 (`fe6dc9f`) and Round 2 (`17d273b`) HIGH, MEDIUM, and regression-covered LOW/INFO findings from `egm-design` and `egm-codebase-details` | AUTOMATED_TESTED (51/51 passing) |
+| M9: Round 3 Final Audit, Packaging & Prerelease Publication | Fresh-context Round 3 EGM audits (`egm-design` & `egm-codebase-details`) of `17d273be3021f1ebe3ed4381663a3d11131c123c` both returned `ACCEPTED_WITH_MINOR_NOTES` (0 HIGH, 0 MEDIUM); wheel/sdist built & clean-room verified; `HANDOFF.txt` & `v0.2.0-beta.1` published to `https://github.com/j0581233919-creator/TijaraGuard` (live external SaaS/API credentials `NOT_TESTED`) | AUTOMATED_TESTED / PUBLISHED (`v0.2.0-beta.1`) |

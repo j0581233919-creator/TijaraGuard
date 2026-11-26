@@ -20,6 +20,17 @@ python3 -m venv .venv
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard inspect-deps
 ```
 
+### 2a. Installing from GitHub Release Wheel & Verifying Checksums
+
+Download `tijaraguard-0.2.0b1-py3-none-any.whl` (or `tijaraguard-0.2.0b1.tar.gz`) and `SHA256SUMS.txt` from the GitHub prerelease (`v0.2.0-beta.1`), then verify integrity before installing offline (`dependencies = []`):
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing
+python3 -m venv .venv
+.venv/bin/python -B -m pip install --no-deps tijaraguard-0.2.0b1-py3-none-any.whl
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/tijaraguard inspect-deps
+```
+
 ## 3. CLI Reference
 
 - `tijaraguard inspect-deps` — Inspect resolved dependencies (`sibling_repo` / `vendored`) and manifest checksums.

@@ -42,6 +42,12 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m tijaraguard serve
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
 ```
 
+## Release Status & Continuity
+
+- **Current Prerelease:** `v0.2.0-beta.1` (`0.2.0b1` in [pyproject.toml](pyproject.toml))
+- **Audited Code Commit:** `17d273be3021f1ebe3ed4381663a3d11131c123c` (`main`), `51/51` automated tests passing (`unittest discover -s tests -v`), Round 3 independent fresh-context EGM audits (`egm-design` & `egm-codebase-details`) both **`ACCEPTED_WITH_MINOR_NOTES`** (`0 HIGH`, `0 MEDIUM`).
+- **Verification Boundary:** All AI providers, official messaging channels, CLI, REST API, SQLite migrations, and security controls are `AUTOMATED_TESTED` using controlled local `ThreadingHTTPServer` endpoints and synthetic data. Live calls against external third-party APIs (OpenAI, Groq, OpenRouter, Mistral, Anthropic, Gemini, Meta WhatsApp Cloud, Telegram Bot API, live Chatwoot servers) require real operator credentials and remain `NOT_TESTED`.
+
 ## Documentation
 
 - [INSTALL.md](INSTALL.md) — Clean-room installation, CLI commands, and dependency provenance
@@ -50,3 +56,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
 - [SECURITY.md](SECURITY.md) — Threat model, security controls, and honest residual boundaries
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — MIT upstream attributions (`BayanGate`, `CatalogCopilot`, `MessageShield`)
 - [LEDGER.md](LEDGER.md) — Authoritative engineering execution ledger
+- [HANDOFF.txt](HANDOFF.txt) — Permanent engineering continuity and release handoff record
